@@ -79,8 +79,3 @@ test-results/
 # Jupyter
 *.ipynb_checkpoints
 .ipynb_checkpoints/
-
-# Docker Compose
-docker-
-
-data/pizza-detection-1/
