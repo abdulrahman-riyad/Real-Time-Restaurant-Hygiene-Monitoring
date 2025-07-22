@@ -1,0 +1,33 @@
+# IDE & OS files
+.idea/
+*.DS_Store
+*.suo
+*.user
+*.log
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# Node.js
+services/frontend/node_modules/
+services/frontend/.next/
+services/frontend/npm-debug.log*
+services/frontend/yarn-debug.log*
+services/frontend/yarn-error.log*
+services/frontend/.env.local
+
+# Build artifacts
+build/
+dist/
+
+# Data
+data/*
+
+# Vids
+Pizza Store Monitoring System 1.0.mp4
+Pizza Store Monitoring System 2.0.mp4

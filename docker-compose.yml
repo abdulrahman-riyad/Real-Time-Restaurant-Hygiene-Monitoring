@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS=admin
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - app-network
+
+  frame-reader:
+    build:
+      context: .
+      dockerfile: ./services/frame-reader/Dockerfile
+    container_name: frame-reader
+    environment:
+      - RABBITMQ_URL=amqp://admin:admin@rabbitmq:5672/
+    volumes:
+      - ./data/videos:/app/videos:ro
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  detection-service:
+    build:
+      context: .
+      dockerfile: ./services/detection-service/Dockerfile
+    container_name: detection-service
+    environment:
+      - RABBITMQ_URL=amqp://admin:admin@rabbitmq:5672/
+      - MODEL_PATH=/app/models/yolo12m-v2.pt
+    volumes:
+      - ./models:/app/models:ro
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  streaming-service:
+    build:
+      context: .
+      dockerfile: ./services/streaming-service/Dockerfile
+    container_name: streaming-service
+    ports:
+      - "8000:8000"
+    environment:
+      - RABBITMQ_URL=amqp://admin:admin@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws
+    depends_on:
+      - streaming-service
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge

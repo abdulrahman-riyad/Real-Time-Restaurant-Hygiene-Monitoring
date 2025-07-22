@@ -1,0 +1,7 @@
+echo __pycache__ > .dockerignore
+echo *.pyc >> .dockerignore
+echo .env >> .dockerignore
+echo venv/ >> .dockerignore
+echo .git >> .dockerignore
+echo node_modules/ >> .dockerignore
+echo .next/ >> .dockerignore
