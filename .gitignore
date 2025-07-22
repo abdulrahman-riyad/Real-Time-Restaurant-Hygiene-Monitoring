@@ -4,6 +4,7 @@
 *.DS_Store
 Thumbs.db
 desktop.ini
+*.swp
 
 # Python
 venv/
@@ -74,3 +75,10 @@ coverage/
 *.cover
 *.pyc
 test-results/
+
+# Jupyter
+*.ipynb_checkpoints
+.ipynb_checkpoints/
+
+# Docker Compose
+docker-
