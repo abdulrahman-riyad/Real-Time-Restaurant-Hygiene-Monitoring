@@ -1,33 +1,79 @@
 # IDE & OS files
 .idea/
+.vscode/
 *.DS_Store
 *.suo
 *.user
 *.log
+Thumbs.db
+desktop.ini
 
 # Python
 venv/
+env/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.env
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Node.js
-services/frontend/node_modules/
-services/frontend/.next/
-services/frontend/npm-debug.log*
-services/frontend/yarn-debug.log*
-services/frontend/yarn-error.log*
-services/frontend/.env.local
+node_modules/
+.next/
+.cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Environment variables
+.env
+.env.*
+!.env.example
 
 # Build artifacts
 build/
 dist/
+out/
+*.zip
+*.tar.gz
 
-# Data
+# Data and media files
 data/*
+*.mp4
+*.avi
+*.mov
+*.wmv
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.pdf
 
-# Vids
-Pizza Store Monitoring System 1.0.mp4
-Pizza Store Monitoring System 2.0.mp4
+# Large file types
+*.iso
+*.bin
+*.exe
+*.msi
+*.jar
+
+# Keep data directory but ignore contents
+!data/.gitkeep
