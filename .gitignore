@@ -82,3 +82,5 @@ test-results/
 
 # Docker Compose
 docker-
+
+data/pizza-detection-1/
