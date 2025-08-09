@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -64,20 +65,36 @@ class ROIProcessor:
             self.load_defaults()
 
     def load_defaults(self):
-        """Load default ROI configuration"""
-        # Default protein container area
+        """Load default ROI configuration based on typical pizza store layout"""
+        # Default protein container area - adjusted for 640x480 video
+        # This is typically on the left side of the preparation area
         default_roi = ROI(
             id="roi_1",
             name="Protein Container",
-            x1=200,
-            y1=150,
-            x2=440,
-            y2=350,
+            x1=120,  # Adjusted for better positioning
+            y1=180,  # Middle-left area
+            x2=280,  # About 160px wide
+            y2=320,  # About 140px tall
             type="protein_container"
         )
         self.add_roi(default_roi)
+        
+        # Optional: Add secondary ingredient container
+        # Uncomment if needed for multi-container tracking
+        """
+        secondary_roi = ROI(
+            id="roi_2",
+            name="Vegetable Container",
+            x1=360,
+            y1=180,
+            x2=520,
+            y2=320,
+            type="vegetable_container"
+        )
+        self.add_roi(secondary_roi)
+        """
 
-        logger.info(f"Loaded default ROI: {default_roi.name}")
+        logger.info(f"Loaded default ROI: {default_roi.name} at ({default_roi.x1}, {default_roi.y1}) to ({default_roi.x2}, {default_roi.y2})")
 
     def load_from_config(self, config_path: str):
         """Load ROIs from JSON configuration file"""
@@ -85,7 +102,18 @@ class ROIProcessor:
             with open(config_path, 'r') as f:
                 config = json.load(f)
 
+            # Check if config has frame dimensions for scaling
+            frame_width = config.get('frame_width', 640)
+            frame_height = config.get('frame_height', 480)
+            
             for roi_data in config.get('rois', []):
+                # Scale ROI coordinates if they're normalized (0-1 range)
+                if all(0 <= roi_data.get(coord, 0) <= 1 for coord in ['x1', 'y1', 'x2', 'y2']):
+                    roi_data['x1'] *= frame_width
+                    roi_data['x2'] *= frame_width
+                    roi_data['y1'] *= frame_height
+                    roi_data['y2'] *= frame_height
+                
                 roi = ROI(**roi_data)
                 self.add_roi(roi)
 
@@ -95,10 +123,12 @@ class ROIProcessor:
             logger.error(f"Failed to load ROI config: {e}")
             self.load_defaults()
 
-    def save_to_config(self, config_path: str):
+    def save_to_config(self, config_path: str, frame_width: int = 640, frame_height: int = 480):
         """Save current ROI configuration to file"""
         try:
             config = {
+                'frame_width': frame_width,
+                'frame_height': frame_height,
                 'rois': [roi.to_dict() for roi in self.rois.values()]
             }
 
@@ -176,8 +206,27 @@ class ROIProcessor:
             roi.y1 *= scale_y
             roi.y2 *= scale_y
 
+    def auto_adjust_rois(self, frame_width: int, frame_height: int):
+        """Auto-adjust ROIs based on frame dimensions"""
+        # If frame is different from expected 640x480, scale ROIs
+        expected_width = 640
+        expected_height = 480
+        
+        if frame_width != expected_width or frame_height != expected_height:
+            scale_x = frame_width / expected_width
+            scale_y = frame_height / expected_height
+            self.scale_rois(scale_x, scale_y)
+            logger.info(f"Auto-adjusted ROIs for frame size {frame_width}x{frame_height}")
+
     def get_visualization_data(self) -> List[Dict]:
         """Get ROI data formatted for visualization"""
+        colors = {
+            'protein_container': '#3B82F6',  # Blue
+            'vegetable_container': '#10B981',  # Green
+            'cheese_container': '#F59E0B',  # Yellow
+            'sauce_container': '#EF4444'  # Red
+        }
+        
         return [
             {
                 'id': roi.id,
@@ -188,7 +237,7 @@ class ROIProcessor:
                     'x2': roi.x2,
                     'y2': roi.y2
                 },
-                'color': '#3B82F6' if roi.type == 'protein_container' else '#10B981',
+                'color': colors.get(roi.type, '#6B7280'),  # Default gray
                 'active': roi.active
             }
             for roi in self.rois.values()
@@ -208,7 +257,41 @@ class ROIProcessor:
             if roi.x1 >= roi.x2 or roi.y1 >= roi.y2:
                 warnings.append(f"ROI {roi.id} has invalid dimensions")
 
+            # Check if ROI is too small
+            min_size = 50  # minimum 50x50 pixels
+            if (roi.x2 - roi.x1) < min_size or (roi.y2 - roi.y1) < min_size:
+                warnings.append(f"ROI {roi.id} is too small (< {min_size}x{min_size} pixels)")
+
         return warnings
+
+    def suggest_roi_placement(self, detections: List[Dict], frame_count: int = 100) -> Dict[str, Tuple[float, float, float, float]]:
+        """Suggest ROI placement based on detected container patterns"""
+        # This method can analyze detection patterns to suggest optimal ROI placement
+        # Useful for initial setup or calibration
+        container_candidates = defaultdict(list)
+        
+        # Analyze where hands frequently appear (potential container locations)
+        for detection in detections:
+            if detection.get('class_name', '').lower() == 'hand':
+                center = detection['center']
+                # Group nearby hand detections
+                grid_x = int(center['x'] / 100)
+                grid_y = int(center['y'] / 100)
+                container_candidates[(grid_x, grid_y)].append(center)
+        
+        # Find most frequent hand interaction areas
+        suggestions = {}
+        for (grid_x, grid_y), positions in container_candidates.items():
+            if len(positions) > frame_count * 0.1:  # At least 10% of frames
+                # Calculate bounding box for this area
+                xs = [p['x'] for p in positions]
+                ys = [p['y'] for p in positions]
+                suggestions[f"suggested_roi_{grid_x}_{grid_y}"] = (
+                    min(xs) - 30, min(ys) - 30,
+                    max(xs) + 30, max(ys) + 30
+                )
+        
+        return suggestions
 
 
 # Example usage and testing
@@ -216,31 +299,31 @@ if __name__ == "__main__":
     # Create ROI processor
     processor = ROIProcessor()
 
-    # Add additional ROI
-    new_roi = ROI(
-        id="roi_2",
-        name="Secondary Container",
-        x1=100,
-        y1=200,
-        x2=300,
-        y2=400,
-        type="ingredient_container"
-    )
-    processor.add_roi(new_roi)
-
-    # Test point checking
-    test_points = [
-        (250, 250),  # In default ROI
-        (150, 300),  # In secondary ROI
-        (500, 500),  # Outside all ROIs
-    ]
-
-    for x, y in test_points:
-        rois = processor.check_point_in_rois(x, y)
-        if rois:
-            print(f"Point ({x}, {y}) is in ROIs: {[roi.name for roi in rois]}")
-        else:
-            print(f"Point ({x}, {y}) is not in any ROI")
-
-    # Save configuration
-    processor.save_to_config("roi_config.json")
+    # Test with custom configuration
+    custom_config = {
+        'frame_width': 640,
+        'frame_height': 480,
+        'rois': [
+            {
+                'id': 'roi_1',
+                'name': 'Main Protein Container',
+                'x1': 100,
+                'y1': 150,
+                'x2': 300,
+                'y2': 350,
+                'type': 'protein_container'
+            }
+        ]
+    }
+    
+    # Save and load config
+    processor.save_to_config('roi_config.json')
+    
+    # Validate ROI placement
+    warnings = processor.validate_roi_placement(640, 480)
+    if warnings:
+        print("Validation warnings:", warnings)
+    
+    # Get visualization data
+    viz_data = processor.get_visualization_data()
+    print("Visualization data:", viz_data)

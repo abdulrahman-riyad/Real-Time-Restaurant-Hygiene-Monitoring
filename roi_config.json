@@ -1,0 +1,16 @@
+{
+  "frame_width": 640,
+  "frame_height": 480,
+  "rois": [
+    {
+      "id": "roi_1",
+      "name": "Main Protein Container",
+      "x1": 120,
+      "y1": 180,
+      "x2": 280,
+      "y2": 320,
+      "type": "protein_container",
+      "active": true
+    }
+  ]
+}
