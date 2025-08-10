@@ -1,4 +1,5 @@
 import pika
+import pika.exceptions  # Explicit import for Pylance
 import json
 import logging
 import time
@@ -7,6 +8,10 @@ import base64
 import numpy as np
 import cv2
 from pathlib import Path
+from typing import Optional, cast
+
+# Import the concrete BlockingChannel type for correct type hints
+from pika.adapters.blocking_connection import BlockingChannel
 
 # Import your custom modules
 from yolo_detector import YOLODetector
@@ -23,8 +28,9 @@ class DetectionService:
 
     def __init__(self, rabbitmq_url: str, model_path: str):
         self.rabbitmq_url = rabbitmq_url
-        self.connection = None
-        self.channel = None
+        self.connection: Optional[pika.BlockingConnection] = None
+        # Use BlockingChannel type (not pika.channel.Channel which Pylance can't resolve)
+        self.channel: Optional[BlockingChannel] = None
         self.frame_dimensions = None  # Will be set from first frame
 
         # Initialize detection components
@@ -71,20 +77,38 @@ class DetectionService:
         for i in range(max_retries):
             try:
                 self.connection = pika.BlockingConnection(pika.URLParameters(self.rabbitmq_url))
-                self.channel = self.connection.channel()
-                
-                # Ensure both queues exist
-                self.channel.queue_declare(queue='video_frames', durable=True)
-                self.channel.queue_declare(queue='detection_results', durable=True)
+                # Cast the returned channel to BlockingChannel so type checker knows it's not None
+                ch = cast(BlockingChannel, self.connection.channel())
+
+                # Ensure both queues exist (ch is a concrete BlockingChannel)
+                ch.queue_declare(queue='video_frames', durable=True)
+                ch.queue_declare(queue='detection_results', durable=True)
+
+                # save channel to instance after successful declarations
+                self.channel = ch
                 
                 logger.info("Successfully connected to RabbitMQ.")
                 return
             except pika.exceptions.AMQPConnectionError as e:
                 logger.error(f"RabbitMQ connection failed (attempt {i + 1}/{max_retries}): {e}")
                 time.sleep(5)
+            except Exception as e:
+                logger.error(f"Unexpected error connecting to RabbitMQ: {e}")
+                time.sleep(5)
         raise Exception("Failed to connect to RabbitMQ after multiple retries.")
 
-    def process_frame(self, ch, method, properties, body):
+    def _ensure_connection(self):
+        """Ensure connection and channel are available."""
+        if self.connection is None or self.connection.is_closed:
+            self._connect_rabbitmq()
+        if self.channel is None or self.channel.is_closed:
+            if self.connection and not self.connection.is_closed:
+                # cast again so Pylance knows this is a BlockingChannel
+                self.channel = cast(BlockingChannel, self.connection.channel())
+            else:
+                self._connect_rabbitmq()
+
+    def process_frame(self, ch: BlockingChannel, method, properties, body):
         """Core callback function that processes each frame."""
         try:
             frame_data = json.loads(body)
@@ -164,13 +188,16 @@ class DetectionService:
                 'stats': self.violation_detector.get_statistics()
             }
             
-            # Publish results
-            self.channel.basic_publish(
-                exchange='',
-                routing_key='detection_results',
-                body=json.dumps(result_message),
-                properties=pika.BasicProperties(delivery_mode=2)
-            )
+            # Ensure channel is available before publishing
+            self._ensure_connection()
+            if self.channel:
+                # Publish results
+                self.channel.basic_publish(
+                    exchange='',
+                    routing_key='detection_results',
+                    body=json.dumps(result_message),
+                    properties=pika.BasicProperties(delivery_mode=2)
+                )
             
             # Update performance metrics
             self.frames_processed += 1
@@ -193,6 +220,12 @@ class DetectionService:
         """Starts the service by consuming messages from the queue."""
         logger.info("Starting detection service and waiting for frames...")
         
+        # Ensure connection is established
+        self._ensure_connection()
+        
+        if not self.channel:
+            raise RuntimeError("Failed to establish channel connection")
+        
         # Set Quality of Service: only pre-fetch 1 message at a time
         self.channel.basic_qos(prefetch_count=1)
         self.channel.basic_consume(
@@ -212,8 +245,10 @@ class DetectionService:
             logger.info(f"Total frames processed: {self.frames_processed}")
             logger.info(f"Total violations detected: {len(self.violation_detector.confirmed_violations)}")
             
-            self.channel.stop_consuming()
-            self.connection.close()
+            if self.channel and not self.channel.is_closed:
+                self.channel.stop_consuming()
+            if self.connection and not self.connection.is_closed:
+                self.connection.close()
 
 
 def check_model_file(model_path: str) -> bool:

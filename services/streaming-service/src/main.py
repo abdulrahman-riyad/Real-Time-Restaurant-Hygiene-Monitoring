@@ -7,13 +7,14 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from queue import Queue, Empty
 
 import cv2
 import httpx
 import numpy as np
 import pika
+import pika.exceptions  # Explicit import
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -38,13 +39,13 @@ class ConnectionManager:
         client_id = str(uuid.uuid4())
         await websocket.accept()
         self.active_connections[client_id] = websocket
-        logger.info(f"Client {client_id} connected.")
+        logger.info(f"Client {client_id} connected. Total connections: {len(self.active_connections)}")
         return client_id
 
     def disconnect(self, client_id: str):
         if client_id in self.active_connections:
             del self.active_connections[client_id]
-            logger.info(f"Client {client_id} disconnected.")
+            logger.info(f"Client {client_id} disconnected. Remaining connections: {len(self.active_connections)}")
 
     async def broadcast_json(self, data: dict):
         """Sends a JSON payload to all connected clients."""
@@ -52,11 +53,23 @@ class ConnectionManager:
             return
             
         message = json.dumps(data)
-        # Use asyncio.gather to send to all clients concurrently for performance
-        await asyncio.gather(
+        disconnected_clients = []
+        
+        # Send to all clients, tracking any that fail
+        results = await asyncio.gather(
             *(conn.send_text(message) for conn in self.active_connections.values()),
-            return_exceptions=True  # Prevent one failed client from stopping others
+            return_exceptions=True
         )
+        
+        # Clean up any disconnected clients
+        for client_id, result in zip(self.active_connections.keys(), results):
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to send to client {client_id}: {result}")
+                disconnected_clients.append(client_id)
+        
+        # Remove disconnected clients
+        for client_id in disconnected_clients:
+            self.disconnect(client_id)
 
 # --- Main Service Class ---
 class StreamingService:
@@ -66,226 +79,436 @@ class StreamingService:
         self.manager = ConnectionManager()
         self.violation_history = deque(maxlen=100)
         
-        # This thread-safe queue is the bridge between the sync consumer and async main loop
-        self.data_queue = Queue()
+        # Thread-safe queue for sync/async bridge
+        self.data_queue: Queue = Queue()
         
-        # Decoupled state dictionaries
-        self.latest_frames = {}
-        self.latest_detections = defaultdict(dict)
-        self.stream_stats = defaultdict(lambda: {'violations_count': 0, 'fps_counter': 0, 'last_fps_update': time.time(), 'fps': 0.0})
+        # State management
+        self.latest_frames: Dict[str, str] = {}
+        self.latest_detections: Dict[str, dict] = defaultdict(dict)
+        self.stream_stats = defaultdict(lambda: {
+            'violations_count': 0, 
+            'fps_counter': 0, 
+            'last_fps_update': time.time(), 
+            'fps': 0.0
+        })
+        
+        # Connection state
+        self.rabbitmq_connection: Optional[pika.BlockingConnection] = None
+        self.rabbitmq_channel: Optional[pika.channel.Channel] = None
 
     def start_consumer_thread(self):
         """Starts the RabbitMQ consumer in a background thread."""
         thread = threading.Thread(target=self._run_consumer, daemon=True)
         thread.start()
+        logger.info("Started RabbitMQ consumer thread")
 
     def _run_consumer(self):
-        """This runs in a separate thread. Its ONLY job is to get messages and put them on the queue."""
+        """Runs in a separate thread. Gets messages and puts them on the queue."""
+        retry_count = 0
+        max_retries = 5
+        
         while True:
             try:
-                connection = pika.BlockingConnection(pika.URLParameters(self.rabbitmq_url))
-                channel = connection.channel()
+                # Create connection with retry logic
+                logger.info(f"Connecting to RabbitMQ at {self.rabbitmq_url}")
+                self.rabbitmq_connection = pika.BlockingConnection(
+                    pika.URLParameters(self.rabbitmq_url)
+                )
+                self.rabbitmq_channel = self.rabbitmq_connection.channel()
                 
-                # Ensure both queues we listen to exist
-                channel.queue_declare(queue='video_frames', durable=True)
-                channel.queue_declare(queue='detection_results', durable=True)
+                # Ensure queues exist
+                self.rabbitmq_channel.queue_declare(queue='video_frames', durable=True)
+                self.rabbitmq_channel.queue_declare(queue='detection_results', durable=True)
                 
                 def callback(ch, method, properties, body):
-                    # This is a synchronous function. It safely puts data onto the queue
-                    # for the main async loop to process.
-                    self.data_queue.put({'queue': method.routing_key, 'body': body})
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    try:
+                        # Put data on queue for async processing
+                        self.data_queue.put({
+                            'queue': method.routing_key, 
+                            'body': body
+                        })
+                        ch.basic_ack(delivery_tag=method.delivery_tag)
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}")
+                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
-                channel.basic_consume(queue='video_frames', on_message_callback=callback)
-                channel.basic_consume(queue='detection_results', on_message_callback=callback)
+                # Set up consumers
+                self.rabbitmq_channel.basic_consume(
+                    queue='video_frames', 
+                    on_message_callback=callback
+                )
+                self.rabbitmq_channel.basic_consume(
+                    queue='detection_results', 
+                    on_message_callback=callback
+                )
 
-                logger.info("Starting RabbitMQ consumer...")
-                channel.start_consuming()
-            except pika.exceptions.AMQPConnectionError:
-                logger.error("RabbitMQ connection failed. Retrying in 5 seconds...")
-                time.sleep(5)
+                logger.info("✅ RabbitMQ consumer started successfully")
+                retry_count = 0  # Reset retry count on successful connection
+                
+                # Start consuming
+                self.rabbitmq_channel.start_consuming()
+                
+            except pika.exceptions.AMQPConnectionError as e:
+                retry_count += 1
+                wait_time = min(5 * retry_count, 30)  # Exponential backoff up to 30 seconds
+                logger.error(f"RabbitMQ connection failed (attempt {retry_count}): {e}")
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+                
             except Exception as e:
-                logger.error(f"An unexpected error occurred in consumer: {e}. Restarting in 5 seconds...")
+                logger.error(f"Unexpected error in consumer: {e}", exc_info=True)
                 time.sleep(5)
+            
+            finally:
+                # Clean up connections
+                try:
+                    if self.rabbitmq_channel and not self.rabbitmq_channel.is_closed:
+                        self.rabbitmq_channel.close()
+                    if self.rabbitmq_connection and not self.rabbitmq_connection.is_closed:
+                        self.rabbitmq_connection.close()
+                except:
+                    pass
 
     def _get_class_color(self, class_name: str) -> tuple:
-        """Helper to get a consistent color for each detected object class."""
+        """Get consistent color for each detected object class."""
         colors = {
-            'person': (255, 165, 0), 'hand': (0, 0, 255), 'pizza': (128, 0, 128), 
-            'scooper': (0, 255, 0), 'Hand': (0, 0, 255), 'Scooper': (0, 255, 0)
+            'person': (255, 165, 0),  # Orange
+            'hand': (0, 0, 255),      # Red
+            'pizza': (128, 0, 128),   # Purple
+            'scooper': (0, 255, 0),   # Green
         }
-        # Use .lower() to handle potential capitalization inconsistencies from the model
-        return colors.get(class_name.lower(), (128, 128, 128))
+        # Handle case variations
+        return colors.get(class_name.lower(), (128, 128, 128))  # Gray default
 
     def _draw_on_frame(self, frame_b64: str, detections: List, violations: List, rois: List) -> str:
         """Draws all annotations on a frame."""
         try:
+            # Decode base64 frame
             img_data = base64.b64decode(frame_b64)
             np_arr = np.frombuffer(img_data, np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
             if frame is None:
+                logger.warning("Failed to decode frame for annotation")
                 return frame_b64
 
+            # Draw ROIs (Regions of Interest)
             for roi in rois:
                 coords = roi.get('coords', {})
-                cv2.rectangle(frame, (int(coords['x1']), int(coords['y1'])), (int(coords['x2']), int(coords['y2'])), (255, 0, 0), 2)
-                cv2.putText(frame, roi.get('name', 'ROI'), (int(coords['x1']), int(coords['y1']) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                if all(k in coords for k in ['x1', 'y1', 'x2', 'y2']):
+                    cv2.rectangle(
+                        frame, 
+                        (int(coords['x1']), int(coords['y1'])), 
+                        (int(coords['x2']), int(coords['y2'])), 
+                        (255, 0, 0), 2  # Blue for ROI
+                    )
+                    cv2.putText(
+                        frame, 
+                        roi.get('name', 'ROI'), 
+                        (int(coords['x1']), int(coords['y1']) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2
+                    )
 
+            # Draw detections
             for d in detections:
-                bbox, name, conf = d.get('bbox'), d.get('class_name'), d.get('confidence')
-                if not all([bbox, name, conf]): continue
-                color = self._get_class_color(name)
-                cv2.rectangle(frame, (int(bbox['x1']), int(bbox['y1'])), (int(bbox['x2']), int(bbox['y2'])), color, 2)
-                label = f"{name}: {conf:.2f}"
-                cv2.putText(frame, label, (int(bbox['x1']), int(bbox['y1']) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                bbox = d.get('bbox')
+                name = d.get('class_name')
+                conf = d.get('confidence')
+                
+                if not all([bbox, name, conf]): 
+                    continue
+                    
+                if all(k in bbox for k in ['x1', 'y1', 'x2', 'y2']):
+                    color = self._get_class_color(name)
+                    cv2.rectangle(
+                        frame, 
+                        (int(bbox['x1']), int(bbox['y1'])), 
+                        (int(bbox['x2']), int(bbox['y2'])), 
+                        color, 2
+                    )
+                    label = f"{name}: {conf:.2f}"
+                    cv2.putText(
+                        frame, label, 
+                        (int(bbox['x1']), int(bbox['y1']) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
+                    )
 
+            # Draw violations (with thicker red boxes)
             for v in violations:
                 bbox = v.get('bbox')
-                if not bbox: continue
-                cv2.rectangle(frame, (int(bbox['x1']), int(bbox['y1'])), (int(bbox['x2']), int(bbox['y2'])), (0, 0, 255), 4)
-                cv2.putText(frame, "VIOLATION", (int(bbox['x1']), int(bbox['y1']) - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+                if bbox and all(k in bbox for k in ['x1', 'y1', 'x2', 'y2']):
+                    cv2.rectangle(
+                        frame, 
+                        (int(bbox['x1']), int(bbox['y1'])), 
+                        (int(bbox['x2']), int(bbox['y2'])), 
+                        (0, 0, 255), 4  # Thick red for violations
+                    )
+                    cv2.putText(
+                        frame, "VIOLATION", 
+                        (int(bbox['x1']), int(bbox['y1']) - 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA
+                    )
 
+            # Encode back to base64
             _, buffer = cv2.imencode('.jpg', frame)
             return base64.b64encode(buffer).decode('utf-8')
-        except Exception:
-            # If drawing fails for any reason, return the original raw frame to prevent crashes
-            return frame_b64
+            
+        except Exception as e:
+            logger.error(f"Error drawing annotations: {e}")
+            return frame_b64  # Return original on error
 
     async def main_processing_loop(self):
-        """
-        The new main async loop. It safely gets data from the queue, processes state,
-        combines data, and handles all async broadcasting.
-        """
+        """Main async loop for processing and broadcasting."""
+        logger.info("Starting main processing loop")
+        
         while True:
-            # Process all messages currently in the queue
             try:
-                while not self.data_queue.empty():
-                    item = self.data_queue.get_nowait()
-                    body = item['body']
-                    queue_name = item['queue']
-                    data = json.loads(body)
-                    stream_id = data.get('stream_id')
-                    if not stream_id: continue
+                # Process all messages currently in queue
+                messages_processed = 0
+                max_messages_per_cycle = 10  # Prevent blocking too long
+                
+                while not self.data_queue.empty() and messages_processed < max_messages_per_cycle:
+                    try:
+                        item = self.data_queue.get_nowait()
+                        body = item['body']
+                        queue_name = item['queue']
+                        
+                        # Parse message
+                        data = json.loads(body)
+                        stream_id = data.get('stream_id')
+                        
+                        if not stream_id:
+                            continue
+                        
+                        # Process based on queue type
+                        if queue_name == 'video_frames':
+                            self.latest_frames[stream_id] = data.get('frame_data')
+                            
+                        elif queue_name == 'detection_results':
+                            self.latest_detections[stream_id] = data
+                            
+                            # Handle violations
+                            if data.get('violations'):
+                                for v in data['violations']:
+                                    record = {
+                                        'id': str(uuid.uuid4()), 
+                                        'stream_id': stream_id,
+                                        'timestamp': time.time(),
+                                        **v
+                                    }
+                                    self.violation_history.appendleft(record)
+                                    self.stream_stats[stream_id]['violations_count'] += 1
+                                    
+                                    # Broadcast violation alert
+                                    await self.manager.broadcast_json({
+                                        'type': 'violation_alert', 
+                                        'data': record
+                                    })
+                                    logger.info(f"Violation detected in stream {stream_id}")
+                        
+                        messages_processed += 1
+                        
+                    except Empty:
+                        break
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Invalid JSON in message: {e}")
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}")
 
-                    if queue_name == 'video_frames':
-                        self.latest_frames[stream_id] = data.get('frame_data')
-                    elif queue_name == 'detection_results':
-                        self.latest_detections[stream_id] = data
-                        if data.get('violations'):
-                            for v in data['violations']:
-                                record = {'id': str(uuid.uuid4()), 'stream_id': stream_id, **v}
-                                self.violation_history.appendleft(record)
-                                self.stream_stats[stream_id]['violations_count'] += 1
-                                # This is now safe because we are in the main async loop
-                                await self.manager.broadcast_json({'type': 'violation_alert', 'data': record})
-            except Empty:
-                pass # Queue is empty, which is normal
+                # Broadcast current state for all active streams
+                for stream_id in list(self.latest_frames.keys()):
+                    raw_frame = self.latest_frames.get(stream_id)
+                    detection_data = self.latest_detections.get(stream_id, {})
+                    
+                    if not raw_frame:
+                        continue
+
+                    # Update FPS stats
+                    stats = self.stream_stats[stream_id]
+                    stats['fps_counter'] += 1
+                    now = time.time()
+                    
+                    if now - stats['last_fps_update'] >= 1.0:
+                        stats['fps'] = stats['fps_counter']
+                        stats['fps_counter'] = 0
+                        stats['last_fps_update'] = now
+                    
+                    # Draw annotations
+                    annotated_frame = self._draw_on_frame(
+                        raw_frame,
+                        detection_data.get('detections', []),
+                        detection_data.get('violations', []),
+                        detection_data.get('rois', [])
+                    )
+                    
+                    # Prepare and send message
+                    message = {
+                        'type': 'detection_results',
+                        'stream_id': stream_id,
+                        'data': {'annotated_frame_data': annotated_frame},
+                        'stats': {
+                            'fps': stats['fps'], 
+                            'violations_count': stats['violations_count']
+                        }
+                    }
+                    await self.manager.broadcast_json(message)
+                
+                # Control broadcast rate
+                await asyncio.sleep(1 / BROADCAST_FPS)
+                
             except Exception as e:
-                logger.error(f"Error in processing data from queue: {e}")
-
-            # Now, broadcast the latest combined state for all active streams
-            for stream_id in list(self.latest_frames.keys()):
-                raw_frame = self.latest_frames.get(stream_id)
-                detection_data = self.latest_detections.get(stream_id, {})
-                
-                if not raw_frame: continue
-
-                stats = self.stream_stats[stream_id]
-                stats['fps_counter'] += 1
-                now = time.time()
-                if now - stats['last_fps_update'] >= 1.0:
-                    stats['fps'] = stats['fps_counter']
-                    stats['fps_counter'] = 0
-                    stats['last_fps_update'] = now
-                
-                annotated_frame = self._draw_on_frame(
-                    raw_frame,
-                    detection_data.get('detections', []),
-                    detection_data.get('violations', []),
-                    detection_data.get('rois', [])
-                )
-                
-                message = {
-                    'type': 'detection_results',
-                    'stream_id': stream_id,
-                    'data': {'annotated_frame_data': annotated_frame},
-                    'stats': {'fps': stats['fps'], 'violations_count': stats['violations_count']}
-                }
-                await self.manager.broadcast_json(message)
-            
-            # Sleep to maintain the broadcast rate
-            await asyncio.sleep(1 / BROADCAST_FPS)
+                logger.error(f"Error in main processing loop: {e}", exc_info=True)
+                await asyncio.sleep(0.1)  # Brief pause before continuing
 
 # --- FastAPI App Setup ---
 app = FastAPI(title="Streaming Service")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-service = StreamingService(os.getenv("RABBITMQ_URL"))
+app.add_middleware(
+    CORSMiddleware, 
+    allow_origins=["*"], 
+    allow_credentials=True, 
+    allow_methods=["*"], 
+    allow_headers=["*"]
+)
+
+service = StreamingService(os.getenv("RABBITMQ_URL", "amqp://admin:admin@rabbitmq:5672/"))
 
 @app.on_event("startup")
 async def startup_event():
+    """Initialize services on startup."""
+    logger.info("Starting Streaming Service")
     service.start_consumer_thread()
-    # Start the main processing and broadcast loop
     asyncio.create_task(service.main_processing_loop())
+    logger.info("Streaming Service started successfully")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time streaming."""
     client_id = await service.manager.connect(websocket)
     try:
         while True:
-            await websocket.receive_text() # Just keep the connection alive
+            # Keep connection alive
+            data = await websocket.receive_text()
+            # Could handle client messages here if needed
     except WebSocketDisconnect:
-        pass # Normal when client disconnects
+        logger.info(f"WebSocket client {client_id} disconnected normally")
+    except Exception as e:
+        logger.error(f"WebSocket error for client {client_id}: {e}")
     finally:
         service.manager.disconnect(client_id)
 
 @app.post("/api/start-stream")
 async def start_stream_proxy(request: VideoRequest):
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post("http://frame-reader:8001/start-stream", json=request.model_dump(), timeout=10.0)
-        response.raise_for_status()
-        return response.json()
-    except httpx.RequestError:
-        raise HTTPException(status_code=503, detail="Frame processing service is unavailable.")
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.json())
+    """Proxy to frame-reader service to start a stream."""
+    max_retries = 3
+    retry_delay = 2.0
+    
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "http://frame-reader:8001/start-stream", 
+                    json=request.model_dump(), 
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                logger.info(f"Stream started: {request.stream_id}")
+                return response.json()
+                
+        except httpx.ConnectError as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Frame reader not ready, retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.error(f"Frame reader service unavailable after {max_retries} attempts")
+                raise HTTPException(
+                    status_code=503, 
+                    detail="Frame processing service is unavailable. Please try again."
+                )
+        except httpx.HTTPStatusError as exc:
+            logger.error(f"HTTP error from frame reader: {exc.response.status_code}")
+            raise HTTPException(
+                status_code=exc.response.status_code, 
+                detail=exc.response.json()
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error starting stream: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/stop-stream")
 async def stop_stream_proxy():
+    """Proxy to frame-reader service to stop a stream."""
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post("http://frame-reader:8001/stop-stream", timeout=10.0)
-        response.raise_for_status()
-        return response.json()
+            response = await client.post(
+                "http://frame-reader:8001/stop-stream", 
+                timeout=10.0
+            )
+            response.raise_for_status()
+            logger.info("Stream stopped")
+            return response.json()
     except httpx.RequestError:
-        raise HTTPException(status_code=503, detail="Frame processing service is unavailable.")
+        logger.error("Failed to stop stream - frame reader unavailable")
+        raise HTTPException(
+            status_code=503, 
+            detail="Frame processing service is unavailable."
+        )
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.json())
+        raise HTTPException(
+            status_code=exc.response.status_code, 
+            detail=exc.response.json()
+        )
 
 @app.post("/api/flush-stream/{stream_id}")
 async def flush_stream_data(stream_id: str):
-    # This endpoint is kept for manual state clearing if needed
+    """Clear all data for a specific stream."""
+    # Clear stats
     if stream_id in service.stream_stats:
         del service.stream_stats[stream_id]
+    
+    # Clear frames
     if stream_id in service.latest_frames:
         del service.latest_frames[stream_id]
+    
+    # Clear detections
     if stream_id in service.latest_detections:
         del service.latest_detections[stream_id]
-        
+    
+    # Clear violations for this stream
     current_violations = list(service.violation_history)
     service.violation_history.clear()
     for v in current_violations:
         if v.get('stream_id') != stream_id:
             service.violation_history.append(v)
-            
+    
     logger.info(f"Flushed all data for stream ID: {stream_id}")
     return {"status": "flushed", "stream_id": stream_id}
 
 @app.get("/api/violations", response_model=List[Dict[str, Any]])
 async def get_violations():
+    """Get list of recent violations."""
     return list(service.violation_history)
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "healthy", "active_ws_connections": len(service.manager.active_connections)}
+    """Health check endpoint."""
+    return {
+        "status": "healthy", 
+        "active_ws_connections": len(service.manager.active_connections),
+        "active_streams": len(service.latest_frames),
+        "total_violations": len(service.violation_history)
+    }
+
+@app.get("/")
+async def root():
+    """Root endpoint."""
+    return {
+        "service": "Streaming Service",
+        "status": "running",
+        "endpoints": {
+            "websocket": "/ws",
+            "health": "/api/health",
+            "violations": "/api/violations",
+            "start_stream": "/api/start-stream",
+            "stop_stream": "/api/stop-stream"
+        }
+    }
