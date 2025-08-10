@@ -1,3 +1,8 @@
+"""
+File: /services/streaming-service/src/main.py
+Simplified streaming service with all type issues fixed
+"""
+
 import asyncio
 import base64
 import json
@@ -7,14 +12,14 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from queue import Queue, Empty
 
 import cv2
 import httpx
 import numpy as np
 import pika
-import pika.exceptions  # Explicit import
+import pika.exceptions
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -62,7 +67,7 @@ class ConnectionManager:
         )
         
         # Clean up any disconnected clients
-        for client_id, result in zip(self.active_connections.keys(), results):
+        for client_id, result in zip(list(self.active_connections.keys()), results):
             if isinstance(result, Exception):
                 logger.warning(f"Failed to send to client {client_id}: {result}")
                 disconnected_clients.append(client_id)
@@ -80,7 +85,7 @@ class StreamingService:
         self.violation_history = deque(maxlen=100)
         
         # Thread-safe queue for sync/async bridge
-        self.data_queue: Queue = Queue()
+        self.data_queue = Queue()
         
         # State management
         self.latest_frames: Dict[str, str] = {}
@@ -91,10 +96,6 @@ class StreamingService:
             'last_fps_update': time.time(), 
             'fps': 0.0
         })
-        
-        # Connection state
-        self.rabbitmq_connection: Optional[pika.BlockingConnection] = None
-        self.rabbitmq_channel: Optional[pika.channel.Channel] = None
 
     def start_consumer_thread(self):
         """Starts the RabbitMQ consumer in a background thread."""
@@ -108,18 +109,20 @@ class StreamingService:
         max_retries = 5
         
         while True:
+            connection = None
+            channel = None
+            
             try:
                 # Create connection with retry logic
                 logger.info(f"Connecting to RabbitMQ at {self.rabbitmq_url}")
-                self.rabbitmq_connection = pika.BlockingConnection(
-                    pika.URLParameters(self.rabbitmq_url)
-                )
-                self.rabbitmq_channel = self.rabbitmq_connection.channel()
+                connection = pika.BlockingConnection(pika.URLParameters(self.rabbitmq_url))
+                channel = connection.channel()
                 
-                # Ensure queues exist
-                self.rabbitmq_channel.queue_declare(queue='video_frames', durable=True)
-                self.rabbitmq_channel.queue_declare(queue='detection_results', durable=True)
+                # Declare queues
+                channel.queue_declare(queue='video_frames', durable=True)
+                channel.queue_declare(queue='detection_results', durable=True)
                 
+                # Define callback function
                 def callback(ch, method, properties, body):
                     try:
                         # Put data on queue for async processing
@@ -133,20 +136,14 @@ class StreamingService:
                         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
                 # Set up consumers
-                self.rabbitmq_channel.basic_consume(
-                    queue='video_frames', 
-                    on_message_callback=callback
-                )
-                self.rabbitmq_channel.basic_consume(
-                    queue='detection_results', 
-                    on_message_callback=callback
-                )
+                channel.basic_consume(queue='video_frames', on_message_callback=callback)
+                channel.basic_consume(queue='detection_results', on_message_callback=callback)
 
                 logger.info("✅ RabbitMQ consumer started successfully")
                 retry_count = 0  # Reset retry count on successful connection
                 
                 # Start consuming
-                self.rabbitmq_channel.start_consuming()
+                channel.start_consuming()
                 
             except pika.exceptions.AMQPConnectionError as e:
                 retry_count += 1
@@ -162,10 +159,10 @@ class StreamingService:
             finally:
                 # Clean up connections
                 try:
-                    if self.rabbitmq_channel and not self.rabbitmq_channel.is_closed:
-                        self.rabbitmq_channel.close()
-                    if self.rabbitmq_connection and not self.rabbitmq_connection.is_closed:
-                        self.rabbitmq_connection.close()
+                    if channel:
+                        channel.close()
+                    if connection:
+                        connection.close()
                 except:
                     pass
 
@@ -195,30 +192,38 @@ class StreamingService:
             # Draw ROIs (Regions of Interest)
             for roi in rois:
                 coords = roi.get('coords', {})
-                if all(k in coords for k in ['x1', 'y1', 'x2', 'y2']):
-                    cv2.rectangle(
-                        frame, 
-                        (int(coords['x1']), int(coords['y1'])), 
-                        (int(coords['x2']), int(coords['y2'])), 
-                        (255, 0, 0), 2  # Blue for ROI
-                    )
-                    cv2.putText(
-                        frame, 
-                        roi.get('name', 'ROI'), 
-                        (int(coords['x1']), int(coords['y1']) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2
-                    )
+                if coords and all(k in coords for k in ['x1', 'y1', 'x2', 'y2']):
+                    try:
+                        cv2.rectangle(
+                            frame, 
+                            (int(coords['x1']), int(coords['y1'])), 
+                            (int(coords['x2']), int(coords['y2'])), 
+                            (255, 0, 0), 2  # Blue for ROI
+                        )
+                        cv2.putText(
+                            frame, 
+                            roi.get('name', 'ROI'), 
+                            (int(coords['x1']), int(coords['y1']) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2
+                        )
+                    except:
+                        pass
 
             # Draw detections
             for d in detections:
-                bbox = d.get('bbox')
-                name = d.get('class_name')
-                conf = d.get('confidence')
-                
-                if not all([bbox, name, conf]): 
-                    continue
+                try:
+                    bbox = d.get('bbox')
+                    name = d.get('class_name')
+                    conf = d.get('confidence')
                     
-                if all(k in bbox for k in ['x1', 'y1', 'x2', 'y2']):
+                    # Skip if missing required fields
+                    if not bbox or not name or conf is None:
+                        continue
+                    
+                    # Check bbox has all required keys
+                    if not all(k in bbox for k in ['x1', 'y1', 'x2', 'y2']):
+                        continue
+                    
                     color = self._get_class_color(name)
                     cv2.rectangle(
                         frame, 
@@ -232,26 +237,38 @@ class StreamingService:
                         (int(bbox['x1']), int(bbox['y1']) - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
                     )
+                except Exception as e:
+                    logger.debug(f"Error drawing detection: {e}")
+                    continue
 
             # Draw violations (with thicker red boxes)
             for v in violations:
-                bbox = v.get('bbox')
-                if bbox and all(k in bbox for k in ['x1', 'y1', 'x2', 'y2']):
-                    cv2.rectangle(
-                        frame, 
-                        (int(bbox['x1']), int(bbox['y1'])), 
-                        (int(bbox['x2']), int(bbox['y2'])), 
-                        (0, 0, 255), 4  # Thick red for violations
-                    )
-                    cv2.putText(
-                        frame, "VIOLATION", 
-                        (int(bbox['x1']), int(bbox['y1']) - 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA
-                    )
+                try:
+                    bbox = v.get('bbox')
+                    if bbox and all(k in bbox for k in ['x1', 'y1', 'x2', 'y2']):
+                        cv2.rectangle(
+                            frame, 
+                            (int(bbox['x1']), int(bbox['y1'])), 
+                            (int(bbox['x2']), int(bbox['y2'])), 
+                            (0, 0, 255), 4  # Thick red for violations
+                        )
+                        cv2.putText(
+                            frame, "VIOLATION", 
+                            (int(bbox['x1']), int(bbox['y1']) - 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA
+                        )
+                except:
+                    pass
 
             # Encode back to base64
-            _, buffer = cv2.imencode('.jpg', frame)
-            return base64.b64encode(buffer).decode('utf-8')
+            # Fix for the buffer type issue
+            success, buffer = cv2.imencode('.jpg', frame)
+            if success:
+                # Convert numpy array to bytes properly
+                frame_bytes = buffer.tobytes()
+                return base64.b64encode(frame_bytes).decode('utf-8')
+            else:
+                return frame_b64
             
         except Exception as e:
             logger.error(f"Error drawing annotations: {e}")
