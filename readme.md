@@ -1,122 +1,272 @@
 # Pizza Store Scooper Violation Detection System
 
-## Overview
+## 📌 Overview
 
-This project is a complete, microservices-based computer vision system designed to monitor hygiene protocol compliance in a pizza store. It uses real-time video analysis to detect if employees are using a scooper when handling certain ingredients from designated containers and flags any violations on a live web dashboard.
+This is a **microservices-based computer vision system** designed to monitor hygiene protocol compliance in a pizza store. The system detects whether workers are using a scooper when picking up ingredients (specifically proteins) from designated containers. Any action of picking up these ingredients without a scooper is flagged as a violation.
 
-This system was built to fulfill all requirements of the Computer Vision Engineer assessment from Eagle Vision.
+## 🎯 Key Features
 
----
+- **Real-time violation detection** using a fine-tuned YOLOv8 model
+- **Microservices architecture** for scalability and maintainability
+- **WebSocket-based streaming** for live video display
+- **Automated violation tracking** with detailed logging
+- **Support for multiple workers** simultaneously
+- **Intelligent logic** to distinguish between picking ingredients and cleaning actions
 
-## Key Features
+## 🏗️ System Architecture
 
--   **End-to-End Microservices Pipeline:** A fully functional system from video ingestion to frontend display, with services communicating asynchronously via a message broker.
--   **Real-Time Violation Detection:** Utilizes the provided custom-trained YOLOv8 model to accurately detect hands, scoopers, pizzas, and people in the video stream.
--   **Intelligent Violation Logic:** The system uses a time-based heuristic to distinguish between an employee genuinely picking ingredients versus just quickly passing a hand through the area (e.g., for cleaning), reducing false positives.
--   **Live Web Dashboard:** A responsive and intuitive frontend built with Next.js and TypeScript provides a seamless user experience for monitoring video streams, real-time FPS, and a live list of all detected violations.
--   **Robust and Scalable by Design:** The decoupled architecture allows for individual services to be scaled or updated independently, demonstrating a modern approach to system design.
+The system consists of 5 main microservices:
 
----
+1. **Frame Reader Service** - Ingests video and publishes frames to RabbitMQ
+2. **Detection Service** - Performs object detection and violation logic
+3. **Streaming Service** - Serves annotated video stream via WebSocket
+4. **Frontend UI** - Displays real-time video with detections and violations
+5. **Message Broker (RabbitMQ)** - Handles communication between services
 
-## Architecture
-
-The system is designed with a decoupled, scalable microservices architecture. Communication between backend services is handled by a RabbitMQ message broker to ensure resilience and loose coupling. The `streaming-service` acts as an API Gateway for the frontend, providing a single point of contact.
-
-The data flows through the system as follows:
-
-1.  The **Next.js UI** sends an HTTP request to the **Streaming Service (API Gateway)** to start or stop a video stream.
-2.  The **Streaming Service** forwards this command to the **Frame Reader** service.
-3.  The **Frame Reader** begins reading the specified video file, publishing each frame as a message to the `video_frames` queue in **RabbitMQ**.
-4.  The **Detection Service**, an independent worker, consumes frames from this queue. It performs AI model inference, applies the violation logic, and publishes its findings (bounding boxes, violations, etc.) as a new message to the `detection_results` queue.
-5.  The **Streaming Service** also consumes messages from the `detection_results` queue. It combines this metadata with the original video frames, draws the annotations, and broadcasts the final annotated image and any violation alerts to the **Next.js UI** via a WebSocket connection.
-
-This event-driven approach ensures that each service has a single responsibility and that the system remains responsive and resilient.
-
-### Services
-
--   **Frame Reader (`frame-reader`):** A FastAPI service that ingests video files. It reads frames at a controlled rate and publishes them to the message broker. It is designed as a singleton streamer, processing only one video at a time to ensure clean state management.
--   **Detection Service (`detection-service`):** The core analytical engine. This Python service consumes frames, runs the fine-tuned YOLOv8 model for object detection, and applies the custom time-based violation logic to identify scooper violations.
--   **Streaming Service (`streaming-service`):** A FastAPI service that acts as the API Gateway. It consumes detection results, draws annotations (bounding boxes, ROIs, violation alerts) onto the raw video frames, and broadcasts the final annotated video stream and violation alerts to the frontend via WebSockets.
--   **Frontend (`frontend`):** A Next.js and TypeScript application that provides a real-time monitoring dashboard for viewing the video stream, live stats, and a list of recent violations.
--   **Message Broker (`rabbitmq`):** RabbitMQ, for asynchronous communication and buffering between the backend services.
-
----
-
-## Technology Stack
-
--   **Backend:** Python 3.11, FastAPI, OpenCV, PyTorch, Ultralytics (YOLOv8)
--   **Frontend:** Next.js 14, React 18, TypeScript, Zustand, Tailwind CSS
--   **Infrastructure:** Docker, Docker Compose
--   **Messaging:** RabbitMQ
-
----
-
-## How to Run
-
-The entire system is orchestrated with Docker Compose for a simple, one-command setup.
+## 🚀 Quick Start
 
 ### Prerequisites
 
--   Docker Desktop installed and running on your machine.
+- Docker and Docker Compose installed
+- At least 4GB RAM allocated to Docker
+- The fine-tuned model file: `yolo12m-v2.pt` (place in `models/` directory)
+- Test videos in `data/videos/` directory
 
-### Setup Instructions
+### 1. Clone the Repository
 
-1.  Clone the repository to your local machine.
-2.  Navigate to the project's root directory in your terminal:
-    ```bash
-    cd scooper-detection-system
-    ```
-3.  Build and run all the services using a single command:
-    ```bash
-    docker-compose up --build
-    ```
-    The initial build may take several minutes as it downloads the base Docker images and installs all Python and Node.js dependencies.
+```bash
+git clone <repository-url>
+cd scooper-detection-system
+```
 
-4.  Once all services are running (you will see logs from all five services in your terminal), open your web browser and navigate to:
-    **[http://localhost:3000](http://localhost:3000)**
+### 2. Verify Model File
 
-5.  (Optional) You can view the RabbitMQ management interface to see the message queues at **[http://localhost:15672](http://localhost:15672)** (Username: `admin`, Password: `admin`).
+**CRITICAL**: Ensure the fine-tuned model is in place:
 
-### Usage
+```bash
+# Check if model exists
+ls -lh models/yolo12m-v2.pt
 
-1.  The dashboard will load and show a "Connected" status in the top-right corner.
-2.  Select a source video from the dropdown menu.
-3.  Click the "Start New Stream" button.
-4.  The video player will display the live, annotated video stream.
-5.  As violations are detected according to the logic, the "Recent Violations" list will populate in real-time.
-6.  Click the "Stop Stream" button to gracefully end the video processing.
+# Should show a file around 50-100MB
+# If not present, download from the provided link
+```
+
+### 3. Set Up ROI Configuration
+
+The system includes an optimized ROI configuration. To customize:
+
+```bash
+# Edit roi_config.json to adjust the protein container area
+nano roi_config.json
+```
+
+### 4. Build and Run
+
+```bash
+# Build all services
+docker-compose build
+
+# Start the system
+docker-compose up
+```
+
+### 5. Access the System
+
+- **Frontend Dashboard**: http://localhost:3000
+- **RabbitMQ Management**: http://localhost:15672 (admin/admin)
+- **API Health Check**: http://localhost:8000/api/health
+
+## 🧪 Testing & Validation
+
+### Expected Results
+
+The system should detect the following violations in test videos:
+
+| Video | Expected Violations |
+|-------|-------------------|
+| Sah w b3dha ghalt.mp4 | 1 |
+| Sah w b3dha ghalt (2).mp4 | 2 |
+| Sah w b3dha ghalt (3).mp4 | 1 |
+
+### Running Validation Tests
+
+```bash
+# Make sure system is running first
+docker-compose up -d
+
+# Run validation script
+python validate_system.py
+```
+
+### Manual Testing
+
+1. Open http://localhost:3000
+2. Select a test video from the dropdown
+3. Click "Start New Stream"
+4. Watch for violations in the "Recent Violations" panel
+5. Verify the count matches expected values
+
+## 🔧 Configuration
+
+### Detection Parameters
+
+Edit `services/detection-service/src/violation_logic.py`:
+
+```python
+PICKING_TIME_THRESHOLD = 0.3  # Time in ROI to consider picking
+VIOLATION_COOLDOWN = 2.0      # Cooldown between violations
+SCOOPER_ASSOCIATION_DISTANCE = 150  # Distance to associate scooper
+```
+
+### ROI Configuration
+
+Edit `roi_config.json`:
+
+```json
+{
+  "rois": [{
+    "x1": 80,   // Left boundary
+    "y1": 160,  // Top boundary
+    "x2": 320,  // Right boundary
+    "y2": 360   // Bottom boundary
+  }]
+}
+```
+
+### Model Confidence Thresholds
+
+Edit `services/detection-service/src/main.py`:
+
+```python
+conf_threshold=0.3  # Detection confidence
+iou_threshold=0.4   # NMS IoU threshold
+```
+
+## 📊 Monitoring
+
+### View Logs
+
+```bash
+# All services
+docker-compose logs -f
+
+# Detection service only
+docker-compose logs -f detection-service
+
+# Check for violations
+docker-compose logs detection-service | grep "VIOLATION"
+```
+
+### System Statistics
+
+The detection service logs performance metrics every 10 seconds:
+- Frames processed
+- Average FPS
+- Total violations detected
+- Per-stream violation counts
+
+## 🐛 Troubleshooting
+
+### Model Not Found Error
+
+```bash
+# Verify model exists
+ls -la models/yolo12m-v2.pt
+
+# Check Docker volume mount
+docker-compose exec detection-service ls -la /app/models/
+```
+
+### No Violations Detected
+
+1. Check model is loaded correctly:
+```bash
+docker-compose logs detection-service | grep "Model loaded"
+```
+
+2. Verify ROI covers protein container:
+```bash
+# ROI should be visible as blue rectangle in video
+```
+
+3. Check detection confidence:
+```bash
+docker-compose logs detection-service | grep "Detected"
+```
+
+### WebSocket Connection Issues
+
+```bash
+# Restart streaming service
+docker-compose restart streaming-service
+
+# Check WebSocket health
+curl http://localhost:8000/api/health
+```
+
+## 📁 Project Structure
+
+```
+scooper-detection-system/
+├── models/
+│   └── yolo12m-v2.pt          # Fine-tuned YOLO model (REQUIRED)
+├── data/
+│   └── videos/                 # Test videos
+├── services/
+│   ├── frame-reader/           # Video ingestion service
+│   ├── detection-service/      # Detection & violation logic
+│   ├── streaming-service/      # WebSocket streaming
+│   └── frontend/               # React UI
+├── docker-compose.yml          # Service orchestration
+├── roi_config.json            # ROI configuration
+├── requirements.txt           # Python dependencies
+└── validate_system.py         # Validation script
+```
+
+## 🔑 Key Components
+
+### Violation Detection Logic
+
+The system detects violations using the following sequence:
+
+1. **Hand enters ROI** (protein container area)
+2. **Hand stays in ROI** for picking threshold time (0.3s)
+3. **Hand leaves ROI** and moves to pizza
+4. **Check scooper presence** - if no scooper detected → VIOLATION
+
+### Classes Detected
+
+The fine-tuned model detects:
+- `Hand` - Worker's hands
+- `Person` - Workers
+- `Pizza` - Pizza being prepared
+- `Scooper` - Utensil for picking ingredients
+
+## 📈 Performance Optimization
+
+- Process frames at 10 FPS for optimal balance
+- Use confidence threshold of 0.3 for better detection
+- Implement hand tracking with 100px distance threshold
+- Apply 2-second cooldown between violations
+
+## 🚨 Important Notes
+
+1. **Model Required**: The system REQUIRES the fine-tuned `yolo12m-v2.pt` model
+2. **ROI Placement**: Ensure ROI covers the protein container area
+3. **Multiple Workers**: System handles multiple workers simultaneously
+4. **Cleaning Detection**: Long duration in ROI (>3s) is considered cleaning
+
+## 📝 License
+
+This project was developed as part of a Computer Vision Engineer assessment.
+
+## 🤝 Support
+
+For issues or questions:
+1. Check the logs: `docker-compose logs`
+2. Run validation: `python validate_system.py`
+3. Verify model and ROI configuration
 
 ---
 
-## Development Journey & Key Challenges
-
-Building this system involved overcoming several real-world engineering challenges, which were critical to achieving a stable and functional final product.
-
-### 1. Challenge: System Dependencies in a Minimal Docker Environment
-
--   **Problem:** The backend Python services were consistently crashing on startup with `ImportError` messages for missing shared libraries like `libGL.so.1` and `libgthread-2.0.so.0`.
--   **Analysis:** The chosen base image, `python:3.11-slim`, is highly optimized for size and does not include many system-level libraries required by complex packages like OpenCV for rendering and graphical operations.
--   **Solution:** I systematically identified the missing dependencies from the error logs and updated the `Dockerfile` for each Python service to include an `apt-get install` command for `libgl1-mesa-glx` and `libglib2.0-0`. This created a stable and reproducible environment for the computer vision components to run reliably.
-
-### 2. Challenge: Provided AI Model Incompatibility
-
--   **Problem:** The custom-trained model provided (`yolo12m-v2.pt`) initially failed to load with the latest versions of PyTorch and Ultralytics, throwing a `_pickle.UnpicklingError` related to new security policies.
--   **Analysis:** This indicated the model was trained with an older, now-incompatible version of the libraries. An initial plan to re-train the model was considered.
--   **Solution:** Before re-training, I conducted an experiment by incrementally updating the `ultralytics` library version within the Docker environment. This experiment was successful: a newer version was found to be capable of loading the older model format. This demonstrated a methodical debugging process and dependency management skills, allowing for the use of the original fine-tuned model as intended without the need for a lengthy re-training process.
-
-### 3. Challenge: Real-Time Streaming Instability and Race Conditions
-
--   **Problem:** In early iterations, the video stream on the frontend would often fail to display, even though violation alerts (smaller messages) were being received. This pointed to a complex race condition.
--   **Analysis:** The issue was traced to the backend architecture. A "start stream" command would trigger a new stream, but the `detection-service` could still be processing the last few frames from the *previous* stream from the message queue. The frontend, now listening for a new stream ID, would ignore these old frames, leading to a black screen.
--   **Solution:** I refactored the entire backend state management for robustness.
-    1.  The `frame-reader` was simplified into a strict "singleton streamer" that can only process one video at a time, ensuring clean stops and starts.
-    2.  The `streaming-service` was redesigned with new API endpoints (`/api/stop-stream`, `/api/flush-stream`) to give the client full control over the state.
-    3.  The frontend controls were updated to explicitly call the stop/flush endpoints before starting a new stream, creating a deterministic and user-controlled workflow that completely eliminated the race condition.
-
----
-
-## Future Improvements
-
--   **Model Accuracy:** While the system is fully functional, the model's accuracy could be further improved by training for more epochs on a larger and more varied dataset (e.g., with different lighting conditions and more examples of violation and non-violation interactions).
--   **Persistent Storage:** The `docker-compose.yml` is designed to easily re-integrate a PostgreSQL database. This would allow for the long-term storage of all detected violations for auditing, analytics, and generating compliance reports.
--   **Multi-Stream View:** The frontend could be extended to display multiple video streams on the dashboard simultaneously, allowing a manager to monitor several pizza stations at once.
+**Built with**: Python, FastAPI, React, Docker, RabbitMQ, YOLOv8, OpenCV

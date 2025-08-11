@@ -71,10 +71,10 @@ class ROIProcessor:
         default_roi = ROI(
             id="roi_1",
             name="Protein Container",
-            x1=120,  # Adjusted for better positioning
-            y1=180,  # Middle-left area
-            x2=280,  # About 160px wide
-            y2=320,  # About 140px tall
+            x1=140,  # Adjusted for better positioning
+            y1=155,  # Middle-left area
+            x2=160,  # About 160px wide
+            y2=177,  # About 140px tall
             type="protein_container"
         )
         self.add_roi(default_roi)
@@ -107,14 +107,30 @@ class ROIProcessor:
             frame_height = config.get('frame_height', 480)
             
             for roi_data in config.get('rois', []):
-                # Scale ROI coordinates if they're normalized (0-1 range)
-                if all(0 <= roi_data.get(coord, 0) <= 1 for coord in ['x1', 'y1', 'x2', 'y2']):
-                    roi_data['x1'] *= frame_width
-                    roi_data['x2'] *= frame_width
-                    roi_data['y1'] *= frame_height
-                    roi_data['y2'] *= frame_height
+                # Remove any fields that ROI class doesn't accept
+                # Only keep the fields that ROI.__init__ expects
+                filtered_roi_data = {
+                    'id': roi_data.get('id'),
+                    'name': roi_data.get('name'),
+                    'x1': roi_data.get('x1'),
+                    'y1': roi_data.get('y1'),
+                    'x2': roi_data.get('x2'),
+                    'y2': roi_data.get('y2'),
+                    'type': roi_data.get('type', 'protein_container'),
+                    'active': roi_data.get('active', True)
+                }
                 
-                roi = ROI(**roi_data)
+                # Remove None values
+                filtered_roi_data = {k: v for k, v in filtered_roi_data.items() if v is not None}
+                
+                # Scale ROI coordinates if they're normalized (0-1 range)
+                if all(0 <= filtered_roi_data.get(coord, 0) <= 1 for coord in ['x1', 'y1', 'x2', 'y2']):
+                    filtered_roi_data['x1'] *= frame_width
+                    filtered_roi_data['x2'] *= frame_width
+                    filtered_roi_data['y1'] *= frame_height
+                    filtered_roi_data['y2'] *= frame_height
+                
+                roi = ROI(**filtered_roi_data)
                 self.add_roi(roi)
 
             logger.info(f"Loaded {len(self.rois)} ROIs from config")

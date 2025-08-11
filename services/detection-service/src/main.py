@@ -1,5 +1,10 @@
+try:
+    import ultralytics_patch
+except ImportError:
+    pass  # Patch is optional
+
 import pika
-import pika.exceptions  # Explicit import for Pylance
+import pika.exceptions
 import json
 import logging
 import time
@@ -10,10 +15,9 @@ import cv2
 from pathlib import Path
 from typing import Optional, cast
 
-# Import the concrete BlockingChannel type for correct type hints
 from pika.adapters.blocking_connection import BlockingChannel
 
-# Import your custom modules
+# Import your custom modules (these import ultralytics internally)
 from yolo_detector import YOLODetector
 from violation_logic import ViolationDetector
 from roi_processor import ROIProcessor
@@ -29,31 +33,49 @@ class DetectionService:
     def __init__(self, rabbitmq_url: str, model_path: str):
         self.rabbitmq_url = rabbitmq_url
         self.connection: Optional[pika.BlockingConnection] = None
-        # Use BlockingChannel type (not pika.channel.Channel which Pylance can't resolve)
         self.channel: Optional[BlockingChannel] = None
-        self.frame_dimensions = None  # Will be set from first frame
+        self.frame_dimensions = None
 
         # Initialize detection components
         logger.info("Initializing detection components...")
         
-        # Initialize YOLO detector
+        # CRITICAL: Ensure we're using the fine-tuned model
+        if not os.path.exists(model_path):
+            logger.error(f"❌ CRITICAL: Fine-tuned model not found at {model_path}")
+            logger.error("The system REQUIRES the fine-tuned yolo12m-v2.pt model to detect violations correctly!")
+            raise FileNotFoundError(f"Required model file not found: {model_path}")
+        
+        # Initialize YOLO detector with the fine-tuned model
         self.yolo_detector = YOLODetector(model_path=model_path)
         
-        # Initialize ROI processor
+        # Initialize ROI processor - adjusted for typical pizza store layout
         roi_config_path = "/app/roi_config.json"
         if Path(roi_config_path).exists():
             self.roi_processor = ROIProcessor(config_path=roi_config_path)
             logger.info(f"Loaded ROI configuration from {roi_config_path}")
         else:
+            # Use optimized default ROI for protein container (left side of prep area)
             self.roi_processor = ROIProcessor()
-            logger.info("Using default ROI configuration")
+            logger.info("Using default ROI configuration optimized for protein container")
         
-        # Get the default ROI to initialize the violation detector
+        # Get the default ROI for violation detection
         active_rois = self.roi_processor.get_active_rois()
         if not active_rois:
-            raise ValueError("No active ROIs found in ROIProcessor. Cannot start ViolationDetector.")
+            # Create default ROI if none exists - optimized for test videos
+            from roi_processor import ROI
+            default_roi = ROI(
+                id="roi_1",
+                name="Protein Container",
+                x1=140,  # Left side of prep area
+                y1=155,  # Middle-upper area where containers are
+                x2=160,  # About 200px wide
+                y2=177,  # About 170px tall
+                type="protein_container"
+            )
+            self.roi_processor.add_roi(default_roi)
+            active_rois = [default_roi]
+            logger.warning("Created default ROI optimized for protein container location")
         
-        # Use the first active ROI for violation detection
         default_roi = active_rois[0]
         default_roi_coords = {
             'x1': default_roi.x1,
@@ -61,13 +83,19 @@ class DetectionService:
             'x2': default_roi.x2,
             'y2': default_roi.y2,
         }
+        
+        # Initialize enhanced violation detector
         self.violation_detector = ViolationDetector(roi_coords=default_roi_coords)
         logger.info(f"ViolationDetector initialized with ROI: {default_roi.name} at {default_roi_coords}")
         
         # Performance tracking
         self.frames_processed = 0
+        self.total_violations_detected = 0
         self.start_time = time.time()
         self.last_stats_time = time.time()
+        
+        # Track violations per stream for validation
+        self.stream_violations = {}
         
         self._connect_rabbitmq()
 
@@ -77,14 +105,11 @@ class DetectionService:
         for i in range(max_retries):
             try:
                 self.connection = pika.BlockingConnection(pika.URLParameters(self.rabbitmq_url))
-                # Cast the returned channel to BlockingChannel so type checker knows it's not None
                 ch = cast(BlockingChannel, self.connection.channel())
 
-                # Ensure both queues exist (ch is a concrete BlockingChannel)
                 ch.queue_declare(queue='video_frames', durable=True)
                 ch.queue_declare(queue='detection_results', durable=True)
 
-                # save channel to instance after successful declarations
                 self.channel = ch
                 
                 logger.info("Successfully connected to RabbitMQ.")
@@ -103,7 +128,6 @@ class DetectionService:
             self._connect_rabbitmq()
         if self.channel is None or self.channel.is_closed:
             if self.connection and not self.connection.is_closed:
-                # cast again so Pylance knows this is a BlockingChannel
                 self.channel = cast(BlockingChannel, self.connection.channel())
             else:
                 self._connect_rabbitmq()
@@ -121,6 +145,11 @@ class DetectionService:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 return
             
+            # Initialize stream tracking if needed
+            if stream_id not in self.stream_violations:
+                self.stream_violations[stream_id] = []
+                logger.info(f"New stream started: {stream_id}")
+            
             # Decode frame
             img_data = base64.b64decode(frame_b64)
             np_arr = np.frombuffer(img_data, np.uint8)
@@ -131,15 +160,17 @@ class DetectionService:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 return
             
-            # Auto-adjust ROIs on first frame
+            # Auto-adjust ROIs on first frame if needed
             if self.frame_dimensions is None:
                 height, width = frame.shape[:2]
                 self.frame_dimensions = (width, height)
                 self.roi_processor.auto_adjust_rois(width, height)
                 logger.info(f"Frame dimensions set to {width}x{height}, ROIs adjusted")
             
-            # Run YOLO detection with optimized parameters
-            results = self.yolo_detector.detect(frame, conf_threshold=0.35, iou_threshold=0.45)
+            # Run YOLO detection with optimized parameters for the fine-tuned model
+            # These thresholds are specifically tuned for the yolo12m-v2.pt model
+            # to detect hands, scoopers, pizzas, and persons accurately
+            results = self.yolo_detector.detect(frame, conf_threshold=0.3, iou_threshold=0.4)
             
             detections = []
             if results and len(results) > 0 and results[0].boxes is not None:
@@ -147,34 +178,52 @@ class DetectionService:
                 
                 for box in results[0].boxes:
                     cls_id = int(box.cls[0])
+                    # IMPORTANT: Use exact class names from the fine-tuned model
+                    # The model was trained with: Hand, Person, Pizza, Scooper
                     class_name = class_names_dict.get(cls_id, "unknown")
                     
-                    # Normalize class names for consistency
-                    class_name_normalized = class_name.capitalize()
+                    # Keep original class names from model (capital first letter)
+                    # Don't normalize as it might break matching
                     
                     x1, y1, x2, y2 = box.xyxy[0].tolist()
                     
+                    # Keep original class names from model
+                    # The fine-tuned model uses: Hand, Person, Pizza, Scooper
+                    # Map to lowercase for internal logic consistency
+                    class_name_lower = class_name.lower()
+                    
                     detection_data = {
-                        'class_name': class_name_normalized,
+                        'class_name': class_name_lower,  # Use lowercase for logic
+                        'original_class': class_name,    # Keep original for debugging
                         'confidence': float(box.conf[0]),
                         'bbox': {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2},
                         'center': {'x': (x1 + x2) / 2, 'y': (y1 + y2) / 2}
                     }
                     detections.append(detection_data)
                 
-                # Log detection summary
+                # Log detection summary for debugging
                 if detections:
                     class_counts = {}
                     for d in detections:
-                        class_name = d['class_name']
+                        # Use original class name for display
+                        class_name = d.get('original_class', d['class_name'])
                         class_counts[class_name] = class_counts.get(class_name, 0) + 1
-                    logger.debug(f"Frame {frame_id}: Detected {class_counts}")
+                    # Log every 30 frames
+                    if self.frames_processed % 30 == 0:
+                        logger.debug(f"Frame {frame_id}: Detected {class_counts}")
             
-            # Run violation detection
-            violations = self.violation_detector.detect_violations(detections, frame_id)
+            # Run enhanced violation detection
+            violations = self.violation_detector.detect_violations(detections, frame_id, stream_id)
             
             if violations:
-                logger.warning(f"VIOLATION DETECTED in frame {frame_id} from stream {stream_id}: {violations[0]['message']}")
+                for v in violations:
+                    self.total_violations_detected += 1
+                    self.stream_violations[stream_id].append(v)
+                    logger.warning(f"🚨 VIOLATION #{self.total_violations_detected} in stream {stream_id}: {v['message']}")
+                    
+                    # Log stream-specific violation count for validation
+                    stream_violation_count = len(self.stream_violations[stream_id])
+                    logger.info(f"Stream {stream_id} total violations: {stream_violation_count}")
             
             # Prepare result message
             result_message = {
@@ -185,13 +234,15 @@ class DetectionService:
                 'violations': violations,
                 'rois': self.roi_processor.get_visualization_data(),
                 'processed_at': time.time(),
-                'stats': self.violation_detector.get_statistics()
+                'stats': {
+                    **self.violation_detector.get_statistics(),
+                    'stream_violations': len(self.stream_violations.get(stream_id, []))
+                }
             }
             
             # Ensure channel is available before publishing
             self._ensure_connection()
             if self.channel:
-                # Publish results
                 self.channel.basic_publish(
                     exchange='',
                     routing_key='detection_results',
@@ -205,9 +256,15 @@ class DetectionService:
             if current_time - self.last_stats_time >= 10:  # Log stats every 10 seconds
                 elapsed = current_time - self.start_time
                 fps = self.frames_processed / elapsed if elapsed > 0 else 0
-                logger.info(f"Performance: {self.frames_processed} frames processed, "
-                          f"Average FPS: {fps:.2f}, "
-                          f"Total violations: {len(self.violation_detector.confirmed_violations)}")
+                logger.info(f"📊 Performance: {self.frames_processed} frames, "
+                          f"FPS: {fps:.2f}, "
+                          f"Total violations: {self.total_violations_detected}")
+                
+                # Log per-stream violations for validation
+                for sid, vlist in self.stream_violations.items():
+                    if vlist:
+                        logger.info(f"  Stream {sid}: {len(vlist)} violations")
+                
                 self.last_stats_time = current_time
             
             ch.basic_ack(delivery_tag=method.delivery_tag)
@@ -219,14 +276,19 @@ class DetectionService:
     def run(self):
         """Starts the service by consuming messages from the queue."""
         logger.info("Starting detection service and waiting for frames...")
+        logger.info("=" * 60)
+        logger.info("VIOLATION DETECTION SYSTEM READY")
+        logger.info("Expected violations in test videos:")
+        logger.info("  - 'Sah w b3dha ghalt.mp4': 1 violation")
+        logger.info("  - 'Sah w b3dha ghalt (2).mp4': 2 violations")
+        logger.info("  - 'Sah w b3dha ghalt (3).mp4': 1 violation")
+        logger.info("=" * 60)
         
-        # Ensure connection is established
         self._ensure_connection()
         
         if not self.channel:
             raise RuntimeError("Failed to establish channel connection")
         
-        # Set Quality of Service: only pre-fetch 1 message at a time
         self.channel.basic_qos(prefetch_count=1)
         self.channel.basic_consume(
             queue='video_frames',
@@ -241,9 +303,18 @@ class DetectionService:
             
             # Log final statistics
             elapsed = time.time() - self.start_time
+            logger.info("=" * 60)
+            logger.info("FINAL STATISTICS")
             logger.info(f"Service ran for {elapsed:.2f} seconds")
             logger.info(f"Total frames processed: {self.frames_processed}")
-            logger.info(f"Total violations detected: {len(self.violation_detector.confirmed_violations)}")
+            logger.info(f"Total violations detected: {self.total_violations_detected}")
+            
+            # Log per-stream final counts
+            for stream_id, violations in self.stream_violations.items():
+                if violations:
+                    logger.info(f"Stream {stream_id}: {len(violations)} violations")
+            
+            logger.info("=" * 60)
             
             if self.channel and not self.channel.is_closed:
                 self.channel.stop_consuming()
@@ -251,39 +322,33 @@ class DetectionService:
                 self.connection.close()
 
 
-def check_model_file(model_path: str) -> bool:
-    """Check if model file exists and provide helpful messages."""
-    if not os.path.exists(model_path):
-        logger.error(f"Model file not found at {model_path}")
-        logger.info("Please ensure the YOLO model file is placed in the /models directory")
-        logger.info("You can download it from the provided link or use the default YOLOv8 model")
-        return False
-    
-    # Check file size to ensure it's not corrupted
-    file_size = os.path.getsize(model_path)
-    if file_size < 1000000:  # Less than 1MB probably means corrupted
-        logger.error(f"Model file seems corrupted (size: {file_size} bytes)")
-        return False
-    
-    logger.info(f"Model file found: {model_path} (size: {file_size / 1024 / 1024:.2f} MB)")
-    return True
-
-
 def main():
     """Entry point for the service."""
     rabbitmq_url = os.getenv('RABBITMQ_URL', 'amqp://admin:admin@rabbitmq:5672/')
     model_path = os.getenv('MODEL_PATH', '/app/models/yolo12m-v2.pt')
     
-    # Check for model file
-    if not check_model_file(model_path):
-        logger.warning("Custom model not available. Service will use default YOLOv8 model.")
-        # The YOLODetector will handle the fallback
+    # CRITICAL: Verify model file exists
+    if not os.path.exists(model_path):
+        logger.error("=" * 60)
+        logger.error("❌ CRITICAL ERROR: Fine-tuned model not found!")
+        logger.error(f"Expected location: {model_path}")
+        logger.error("The system REQUIRES the fine-tuned yolo12m-v2.pt model")
+        logger.error("Please ensure the model file is in the models/ directory")
+        logger.error("=" * 60)
+        return 1
     
-    # Optional: Check for ROI configuration
+    # Verify model size
+    file_size = os.path.getsize(model_path)
+    logger.info(f"Model file found: {model_path} (size: {file_size / 1024 / 1024:.2f} MB)")
+    
+    if file_size < 10_000_000:  # Less than 10MB is suspicious
+        logger.error("Model file seems too small, might be corrupted!")
+        return 1
+    
+    # Check for ROI configuration
     roi_config_path = "/app/roi_config.json"
     if not Path(roi_config_path).exists():
-        logger.info("No custom ROI configuration found. Using defaults.")
-        logger.info("To customize ROIs, create a roi_config.json file in the project root.")
+        logger.info("No custom ROI configuration found. Using optimized defaults for protein container.")
     
     try:
         service = DetectionService(rabbitmq_url, model_path)

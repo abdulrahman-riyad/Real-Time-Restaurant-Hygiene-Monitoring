@@ -3,6 +3,13 @@ File: /services/detection-service/src/yolo_detector.py
 YOLO detector module for the Pizza Store Violation Detection System
 """
 
+# Import compatibility module first
+try:
+    from c3k2_compat import inject_c3k2_module
+    inject_c3k2_module()
+except ImportError:
+    pass  # Compatibility module is optional
+
 from ultralytics import YOLO
 import torch
 import logging
@@ -114,8 +121,25 @@ class YOLODetector:
         except Exception as e:
             logger.error(f"❌ CRITICAL ERROR loading model: {e}")
             logger.error(f"Error type: {type(e).__name__}")
-            logger.error(f"This likely means the model file is incompatible or corrupted")
-            logger.error("Please ensure you have the correct 'yolo12m-v2.pt' file")
+            
+            # Check for specific error types
+            if "C3k2" in str(e):
+                logger.error("=" * 60)
+                logger.error("MODEL VERSION COMPATIBILITY ISSUE DETECTED")
+                logger.error("=" * 60)
+                logger.error("The model requires the C3k2 module which is not in your ultralytics version.")
+                logger.error("")
+                logger.error("SOLUTION:")
+                logger.error("1. Update requirements.txt to use: ultralytics>=8.2.0")
+                logger.error("2. Rebuild the detection service:")
+                logger.error("   docker-compose build --no-cache detection-service")
+                logger.error("3. Restart the services:")
+                logger.error("   docker-compose up")
+                logger.error("=" * 60)
+            else:
+                logger.error(f"This likely means the model file is incompatible or corrupted")
+                logger.error("Please ensure you have the correct 'yolo12m-v2.pt' file")
+            
             import traceback
             logger.error(traceback.format_exc())
             sys.exit(1)

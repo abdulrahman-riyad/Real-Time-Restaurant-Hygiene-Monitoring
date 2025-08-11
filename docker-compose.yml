@@ -25,6 +25,7 @@ services:
     container_name: frame-reader
     environment:
       - RABBITMQ_URL=amqp://admin:admin@rabbitmq:5672/
+      - TARGET_PROCESSING_FPS=10
     volumes:
       - ./data/videos:/app/videos:ro
     depends_on:
@@ -42,8 +43,12 @@ services:
     environment:
       - RABBITMQ_URL=amqp://admin:admin@rabbitmq:5672/
       - MODEL_PATH=/app/models/yolo12m-v2.pt
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
     volumes:
+      # CRITICAL: Mount the model file and ROI config
       - ./models:/app/models:ro
+      - ./roi_config.json:/app/roi_config.json:ro
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -60,6 +65,8 @@ services:
       - "8000:8000"
     environment:
       - RABBITMQ_URL=amqp://admin:admin@rabbitmq:5672/
+      - BROADCAST_FPS=15
+      - PYTHONUNBUFFERED=1
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -85,3 +92,6 @@ services:
 networks:
   app-network:
     driver: bridge
+
+volumes:
+  rabbitmq-data:

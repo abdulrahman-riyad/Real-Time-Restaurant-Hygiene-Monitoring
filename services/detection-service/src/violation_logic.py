@@ -1,91 +1,146 @@
 import time
 import logging
 from collections import defaultdict, deque
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 import numpy as np
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
+class HandTracker:
+    """Tracks individual hand movements and interactions"""
+    def __init__(self, hand_id: str, initial_pos: Dict[str, float]):
+        self.id = hand_id
+        self.positions = deque([initial_pos], maxlen=30)
+        self.first_seen = time.time()
+        self.last_seen = time.time()
+        
+        # ROI interaction tracking
+        self.entered_roi_time: Optional[float] = None
+        self.left_roi_time: Optional[float] = None
+        self.time_in_roi: float = 0.0
+        self.picked_from_roi: bool = False
+        
+        # Scooper tracking
+        self.had_scooper_in_roi: bool = False
+        self.scooper_confidence: float = 0.0
+        
+        # Pizza interaction
+        self.moved_to_pizza: bool = False
+        self.pizza_interaction_time: Optional[float] = None
+        
+        # Movement analysis
+        self.total_distance: float = 0.0
+        self.is_active: bool = True
+        
+    def update(self, pos: Dict[str, float]):
+        """Update hand position and calculate movement"""
+        if self.positions:
+            last_pos = self.positions[-1]
+            dist = np.sqrt((pos['x'] - last_pos['x'])**2 + (pos['y'] - last_pos['y'])**2)
+            self.total_distance += dist
+        
+        self.positions.append(pos)
+        self.last_seen = time.time()
+        
+    def get_current_position(self) -> Dict[str, float]:
+        """Get most recent position"""
+        return self.positions[-1] if self.positions else {'x': 0, 'y': 0}
+    
+    def get_average_speed(self) -> float:
+        """Calculate average movement speed"""
+        if len(self.positions) < 2:
+            return 0.0
+        
+        time_span = self.last_seen - self.first_seen
+        if time_span > 0:
+            return self.total_distance / time_span
+        return 0.0
+
+
+class PersonTracker:
+    """Tracks individual persons and their hands"""
+    def __init__(self, person_id: str):
+        self.id = person_id
+        self.associated_hands: Set[str] = set()
+        self.last_seen = time.time()
+        self.violations_count = 0
+
+
 class ViolationDetector:
     """
-    Enhanced violation detector with improved tracking and logic.
-    Handles multiple workers and better distinguishes between cleaning and picking.
+    Enhanced violation detector that properly tracks the sequence:
+    1. Hand enters ROI (protein container)
+    2. Hand picks ingredient (stays in ROI for sufficient time)
+    3. Hand leaves ROI
+    4. Hand moves to pizza
+    5. Check if scooper was used during the picking
     """
+    
     def __init__(self, roi_coords: Dict[str, float]):
         self.roi_coords = roi_coords
         
-        # Track hand states over time
-        self.hand_tracker: Dict[str, 'ViolationDetector.HandState'] = {}  # {hand_id: HandState}
-        self.frame_history: deque = deque(maxlen=30)  # Keep 30 frames of history (~1 second at 30fps)
+        # Enhanced tracking for better violation detection
+        self.hand_states: Dict[str, HandTracker] = {}
+        self.person_trackers: Dict[str, PersonTracker] = {}
         
-        # Thresholds
-        self.PICKING_TIME_THRESHOLD = 0.8  # Increased for better accuracy
-        self.CLEANING_TIME_THRESHOLD = 2.0  # Longer duration indicates cleaning
-        self.VIOLATION_COOLDOWN = 5.0  # Increased cooldown
-        self.MIN_HAND_MOVEMENT = 20  # Minimum pixel movement to consider action
-        self.SCOOPER_PROXIMITY_THRESHOLD = 100  # Pixels distance for scooper association
+        # ADJUSTED THRESHOLDS FOR BETTER DETECTION
+        self.PICKING_TIME_THRESHOLD = 0.2  # Reduced from 0.3 - hand needs to be in ROI for 0.2s
+        self.CLEANING_TIME_THRESHOLD = 3.0  # Longer time suggests cleaning
+        self.VIOLATION_COOLDOWN = 1.5  # Reduced from 2.0 for faster detection
+        self.HAND_TRACKING_DISTANCE = 150  # Increased for better tracking between frames
+        self.SCOOPER_ASSOCIATION_DISTANCE = 200  # Increased for better scooper detection
+        self.PIZZA_PROXIMITY_THRESHOLD = 300  # Increased to detect pizza interaction better
         
         # Violation tracking
-        self.last_violation_times: defaultdict = defaultdict(float)
-        self.confirmed_violations: List[Dict[str, Any]] = []
+        self.violations_per_stream: Dict[str, List[Dict]] = defaultdict(list)
+        self.last_violation_time: Dict[str, float] = {}
+        self.frame_buffer = deque(maxlen=60)  # Keep 2 seconds of history at 30fps
         
-        # Pizza tracking for better context
-        self.pizza_positions: List[Dict[str, float]] = []
+        # Pizza tracking for context
+        self.recent_pizzas: List[Dict[str, float]] = []
+        self.recent_scoopers: List[Dict[str, Any]] = []
+        
+        # Track hands that have been in ROI and left
+        self.hands_that_left_roi: Dict[str, HandTracker] = {}
+        
+        logger.info(f"ViolationDetector initialized with ROI: {roi_coords}")
+        logger.info(f"Thresholds: picking={self.PICKING_TIME_THRESHOLD}s, cooldown={self.VIOLATION_COOLDOWN}s")
 
-    class HandState:
-        def __init__(self, hand_id: str, position: Dict[str, float]):
-            self.id: str = hand_id
-            self.positions: deque = deque([position], maxlen=10)  # Track last 10 positions
-            # Properly type annotate these as Optional[float] since they start as None
-            self.first_seen_in_roi: Optional[float] = None
-            self.last_seen_in_roi: Optional[float] = None
-            self.entry_time: Optional[float] = None
-            self.exit_time: Optional[float] = None
-            self.had_scooper: bool = False
-            self.moved_to_pizza: bool = False
-            self.total_movement: float = 0
-            self.is_cleaning: bool = False
-
-        def update_position(self, position: Dict[str, float]) -> None:
-            if self.positions:
-                last_pos = self.positions[-1]
-                movement = np.sqrt((position['x'] - last_pos['x'])**2 + 
-                                 (position['y'] - last_pos['y'])**2)
-                self.total_movement += movement
-            self.positions.append(position)
-
-        def get_average_movement(self) -> float:
-            if len(self.positions) < 2:
-                return 0
-            total_dist = 0
-            for i in range(1, len(self.positions)):
-                dist = np.sqrt((self.positions[i]['x'] - self.positions[i-1]['x'])**2 + 
-                             (self.positions[i]['y'] - self.positions[i-1]['y'])**2)
-                total_dist += dist
-            return total_dist / (len(self.positions) - 1)
-
-    def _get_hand_id(self, hand: Dict[str, Any], frame_id: str) -> str:
-        """Enhanced hand ID generation for better tracking"""
-        # Use spatial gridding for more stable tracking
-        x, y = int(hand['center']['x'] / 30), int(hand['center']['y'] / 30)
-        return f"hand_{x}_{y}_{frame_id[:8]}"
-
-    def _find_closest_hand_state(self, hand: Dict[str, Any], threshold: float = 50) -> Optional[str]:
-        """Find the closest existing hand state within threshold distance"""
-        hand_center = hand['center']
+    def _find_closest_hand(self, hand_center: Dict[str, float], max_distance: float) -> Optional[str]:
+        """Find the closest existing hand tracker within max_distance"""
         min_dist = float('inf')
         closest_id = None
+        current_time = time.time()
         
-        for hand_id, state in self.hand_tracker.items():
-            if state.positions:
-                last_pos = state.positions[-1]
-                dist = np.sqrt((hand_center['x'] - last_pos['x'])**2 + 
-                             (hand_center['y'] - last_pos['y'])**2)
-                if dist < min_dist and dist < threshold:
-                    min_dist = dist
-                    closest_id = hand_id
+        # Check both active hands and hands that left ROI
+        all_hands = {**self.hand_states, **self.hands_that_left_roi}
+        
+        # Remove very old trackers
+        stale_ids = []
+        for hand_id, tracker in all_hands.items():
+            if current_time - tracker.last_seen > 2.0:  # 2 second timeout
+                stale_ids.append(hand_id)
+        
+        for hand_id in stale_ids:
+            if hand_id in self.hand_states:
+                del self.hand_states[hand_id]
+            if hand_id in self.hands_that_left_roi:
+                del self.hands_that_left_roi[hand_id]
+        
+        # Find closest tracker
+        for hand_id, tracker in all_hands.items():
+            if not tracker.is_active:
+                continue
+                
+            last_pos = tracker.get_current_position()
+            dist = np.sqrt((hand_center['x'] - last_pos['x'])**2 + 
+                          (hand_center['y'] - last_pos['y'])**2)
+            
+            if dist < min_dist and dist < max_distance:
+                min_dist = dist
+                closest_id = hand_id
         
         return closest_id
 
@@ -94,158 +149,233 @@ class ViolationDetector:
         return (self.roi_coords['x1'] <= center['x'] <= self.roi_coords['x2'] and
                 self.roi_coords['y1'] <= center['y'] <= self.roi_coords['y2'])
 
-    def _is_near_pizza(self, center: Dict[str, float], threshold: float = 150) -> bool:
+    def _is_near_pizza(self, center: Dict[str, float]) -> bool:
         """Check if hand is near any detected pizza"""
-        for pizza_pos in self.pizza_positions:
+        # If no pizzas detected, assume there might be one in the preparation area
+        if not self.recent_pizzas:
+            # Check if hand is in typical pizza preparation area (lower part of frame)
+            if center['y'] > 300:  # Lower half of frame where pizzas usually are
+                return True
+        
+        for pizza_pos in self.recent_pizzas:
             dist = np.sqrt((center['x'] - pizza_pos['x'])**2 + 
                           (center['y'] - pizza_pos['y'])**2)
-            if dist < threshold:
+            if dist < self.PIZZA_PROXIMITY_THRESHOLD:
                 return True
         return False
 
-    def _has_scooper_nearby(self, hand: Dict[str, Any], scoopers: List[Dict[str, Any]]) -> bool:
-        """Enhanced scooper detection with proximity check"""
-        hand_center = hand['center']
-        hand_bbox = hand['bbox']
+    def _check_scooper_association(self, hand_bbox: Dict[str, float]) -> Tuple[bool, float]:
+        """Check if a scooper is associated with the hand"""
+        if not self.recent_scoopers:
+            return False, 0.0
         
-        for scooper in scoopers:
-            scooper_center = scooper['center']
-            
-            # Check if scooper center is within expanded hand bbox
-            expanded_margin = 50
-            if (hand_bbox['x1'] - expanded_margin <= scooper_center['x'] <= hand_bbox['x2'] + expanded_margin and
-                hand_bbox['y1'] - expanded_margin <= scooper_center['y'] <= hand_bbox['y2'] + expanded_margin):
-                return True
-            
-            # Also check distance-based proximity
-            dist = np.sqrt((hand_center['x'] - scooper_center['x'])**2 + 
-                          (hand_center['y'] - scooper_center['y'])**2)
-            if dist < self.SCOOPER_PROXIMITY_THRESHOLD:
-                return True
+        hand_center_x = (hand_bbox['x1'] + hand_bbox['x2']) / 2
+        hand_center_y = (hand_bbox['y1'] + hand_bbox['y2']) / 2
         
-        return False
+        best_confidence = 0.0
+        for scooper in self.recent_scoopers:
+            # Get scooper center coordinates
+            scooper_center_x: float = 0.0
+            scooper_center_y: float = 0.0
+            
+            # Handle different scooper data formats
+            if 'bbox' in scooper and isinstance(scooper['bbox'], dict):
+                scooper_bbox = scooper['bbox']
+                scooper_center_x = (scooper_bbox['x1'] + scooper_bbox['x2']) / 2
+                scooper_center_y = (scooper_bbox['y1'] + scooper_bbox['y2']) / 2
+            elif 'center' in scooper and isinstance(scooper['center'], dict):
+                scooper_center_x = scooper['center']['x']
+                scooper_center_y = scooper['center']['y']
+            else:
+                continue
+            
+            # Calculate distance between hand and scooper
+            dist = np.sqrt((hand_center_x - scooper_center_x)**2 + 
+                          (hand_center_y - scooper_center_y)**2)
+            
+            if dist < self.SCOOPER_ASSOCIATION_DISTANCE:
+                confidence = scooper.get('confidence', 0.5)
+                best_confidence = max(best_confidence, confidence)
+                
+                # Check for bounding box overlap
+                if 'bbox' in scooper and isinstance(scooper['bbox'], dict):
+                    scooper_bbox = scooper['bbox']
+                    x_overlap = max(0, min(hand_bbox['x2'], scooper_bbox['x2']) - 
+                                   max(hand_bbox['x1'], scooper_bbox['x1']))
+                    y_overlap = max(0, min(hand_bbox['y2'], scooper_bbox['y2']) - 
+                                   max(hand_bbox['y1'], scooper_bbox['y1']))
+                    
+                    if x_overlap > 0 and y_overlap > 0:
+                        best_confidence = min(1.0, best_confidence + 0.3)
+        
+        return best_confidence > 0.2, best_confidence  # Lower threshold for better detection
 
-    def detect_violations(self, detections: List[Dict[str, Any]], frame_id: str) -> List[Dict[str, Any]]:
-        """Enhanced violation detection with multiple worker support"""
+    def detect_violations(self, detections: List[Dict[str, Any]], frame_id: str, 
+                          stream_id: str = "default") -> List[Dict[str, Any]]:
+        """
+        Main violation detection logic following the exact sequence
+        """
         violations: List[Dict[str, Any]] = []
         current_time = time.time()
         
-        # Separate detections by type
-        hands = [d for d in detections if d.get('class_name', '').lower() == 'hand']
-        scoopers = [d for d in detections if d.get('class_name', '').lower() == 'scooper']
-        pizzas = [d for d in detections if d.get('class_name', '').lower() == 'pizza']
-        persons = [d for d in detections if d.get('class_name', '').lower() == 'person']
+        # Separate detections by class
+        hands: List[Dict[str, Any]] = []
+        scoopers: List[Dict[str, Any]] = []
+        pizzas: List[Dict[str, Any]] = []
+        persons: List[Dict[str, Any]] = []
         
-        # Update pizza positions for context
-        self.pizza_positions = [p['center'] for p in pizzas]
+        for d in detections:
+            class_name = d.get('class_name', '').lower()
+            if 'hand' in class_name:
+                hands.append(d)
+            elif 'scooper' in class_name:
+                scoopers.append(d)
+            elif 'pizza' in class_name:
+                pizzas.append(d)
+            elif 'person' in class_name:
+                persons.append(d)
         
-        # Log detection counts for debugging
-        if hands or scoopers:
+        # Update recent detections for context
+        self.recent_pizzas = []
+        for p in pizzas:
+            if 'center' in p and isinstance(p['center'], dict):
+                self.recent_pizzas.append(p['center'])
+            elif 'bbox' in p and isinstance(p['bbox'], dict):
+                bbox = p['bbox']
+                self.recent_pizzas.append({
+                    'x': (bbox['x1'] + bbox['x2']) / 2,
+                    'y': (bbox['y1'] + bbox['y2']) / 2
+                })
+        
+        self.recent_scoopers = scoopers
+        
+        # Log detection counts periodically
+        if len(self.frame_buffer) % 30 == 0 and (hands or scoopers):
             logger.debug(f"Frame {frame_id}: {len(hands)} hands, {len(scoopers)} scoopers, "
                         f"{len(pizzas)} pizzas, {len(persons)} persons")
         
-        # Track current frame hands
-        current_frame_hand_ids: set = set()
-        
+        # Process each detected hand
         for hand in hands:
-            # Try to match with existing hand state or create new one
-            existing_id = self._find_closest_hand_state(hand)
+            hand_center = hand.get('center')
+            if not hand_center or not isinstance(hand_center, dict):
+                continue
             
-            if existing_id:
-                hand_id = existing_id
-                hand_state = self.hand_tracker[hand_id]
-                hand_state.update_position(hand['center'])
+            hand_bbox = hand.get('bbox')
+            if not hand_bbox or not isinstance(hand_bbox, dict):
+                continue
+            
+            # Find or create hand tracker
+            hand_id = self._find_closest_hand(hand_center, self.HAND_TRACKING_DISTANCE)
+            
+            if hand_id:
+                # Move tracker back to active if it was in the left_roi dict
+                if hand_id in self.hands_that_left_roi:
+                    tracker = self.hands_that_left_roi.pop(hand_id)
+                    self.hand_states[hand_id] = tracker
+                else:
+                    tracker = self.hand_states.get(hand_id)
+                
+                if tracker:
+                    tracker.update(hand_center)
             else:
-                hand_id = self._get_hand_id(hand, frame_id)
-                hand_state = self.HandState(hand_id, hand['center'])
-                self.hand_tracker[hand_id] = hand_state
+                # Create new tracker
+                hand_id = f"hand_{stream_id}_{frame_id}_{len(self.hand_states)}"
+                tracker = HandTracker(hand_id, hand_center)
+                self.hand_states[hand_id] = tracker
             
-            current_frame_hand_ids.add(hand_id)
+            # Check if hand is in ROI
+            in_roi = self._is_in_roi(hand_center)
             
-            # Check if hand has scooper
-            has_scooper = self._has_scooper_nearby(hand, scoopers)
-            if has_scooper:
-                hand_state.had_scooper = True
+            # Check for scooper association
+            has_scooper, scooper_conf = self._check_scooper_association(hand_bbox)
             
-            # Check ROI interaction
-            in_roi = self._is_in_roi(hand['center'])
-            near_pizza = self._is_near_pizza(hand['center'])
-            
+            # Update tracker state based on ROI interaction
             if in_roi:
-                if hand_state.entry_time is None:
-                    hand_state.entry_time = current_time
-                    hand_state.first_seen_in_roi = current_time
-                    logger.info(f"Hand '{hand_id}' entered ROI")
+                if tracker.entered_roi_time is None:
+                    # Hand just entered ROI
+                    tracker.entered_roi_time = current_time
+                    logger.info(f"Hand {hand_id} entered ROI")
                 
-                hand_state.last_seen_in_roi = current_time
-                time_in_roi = current_time - hand_state.entry_time
+                # Update time in ROI
+                tracker.time_in_roi = current_time - tracker.entered_roi_time
                 
-                # Check for cleaning behavior (long duration, repetitive movement)
-                if time_in_roi > self.CLEANING_TIME_THRESHOLD:
-                    avg_movement = hand_state.get_average_movement()
-                    if avg_movement > self.MIN_HAND_MOVEMENT:
-                        hand_state.is_cleaning = True
-                        logger.debug(f"Hand '{hand_id}' appears to be cleaning")
+                # Check if scooper is being used
+                if has_scooper:
+                    tracker.had_scooper_in_roi = True
+                    tracker.scooper_confidence = max(tracker.scooper_confidence, scooper_conf)
+                    logger.debug(f"Hand {hand_id} has scooper (conf: {scooper_conf:.2f})")
                 
-            else:
-                # Hand is outside ROI
-                if hand_state.entry_time is not None and hand_state.exit_time is None:
-                    hand_state.exit_time = current_time
-                    time_in_roi = hand_state.exit_time - hand_state.entry_time
+                # Check if this is a picking action
+                if tracker.time_in_roi >= self.PICKING_TIME_THRESHOLD and not tracker.picked_from_roi:
+                    tracker.picked_from_roi = True
+                    logger.info(f"Hand {hand_id} picked from ROI (time: {tracker.time_in_roi:.2f}s, "
+                               f"scooper: {tracker.had_scooper_in_roi})")
+                
+            else:  # Hand is outside ROI
+                if tracker.entered_roi_time is not None and tracker.picked_from_roi:
+                    # Hand was in ROI and picked something, now it left
+                    if tracker.left_roi_time is None:
+                        tracker.left_roi_time = current_time
+                        logger.info(f"Hand {hand_id} left ROI after {tracker.time_in_roi:.2f}s")
+                        
+                        # Move to hands_that_left_roi for tracking
+                        self.hands_that_left_roi[hand_id] = tracker
+                        if hand_id in self.hand_states:
+                            del self.hand_states[hand_id]
                     
-                    # Check if hand moved to pizza after leaving ROI
-                    if near_pizza:
-                        hand_state.moved_to_pizza = True
+                    # Check if hand moved to pizza
+                    if self._is_near_pizza(hand_center) and not tracker.moved_to_pizza:
+                        tracker.moved_to_pizza = True
+                        tracker.pizza_interaction_time = current_time
                         
-                        # Check violation conditions
-                        in_cooldown = (current_time - self.last_violation_times[hand_id]) < self.VIOLATION_COOLDOWN
+                        # CHECK FOR VIOLATION NOW
+                        cooldown_key = f"{stream_id}_{hand_id}"
+                        in_cooldown = (cooldown_key in self.last_violation_time and 
+                                     current_time - self.last_violation_time[cooldown_key] < self.VIOLATION_COOLDOWN)
                         
-                        if (time_in_roi > self.PICKING_TIME_THRESHOLD and 
-                            not hand_state.is_cleaning and
-                            not hand_state.had_scooper and
-                            not in_cooldown):
-                            
+                        if not tracker.had_scooper_in_roi and not in_cooldown:
+                            # VIOLATION DETECTED!
                             violation = {
-                                'type': 'hand_in_container_without_scooper',
+                                'id': f"violation_{stream_id}_{frame_id}_{len(violations)}",
+                                'type': 'hand_picked_without_scooper',
                                 'severity': 'high',
                                 'confidence': hand.get('confidence', 0.0),
-                                'bbox': hand['bbox'],
+                                'bbox': hand_bbox,
                                 'timestamp': current_time,
                                 'frame_id': frame_id,
-                                'message': f'Hand grabbed ingredient from container without scooper and placed on pizza',
-                                'duration_in_roi': round(time_in_roi, 2),
-                                'person_count': len(persons)  # Track if multiple workers present
+                                'stream_id': stream_id,
+                                'message': 'Worker picked ingredient from protein container without using scooper',
+                                'details': {
+                                    'time_in_roi': round(tracker.time_in_roi, 2),
+                                    'hand_id': hand_id,
+                                    'person_count': len(persons)
+                                }
                             }
-                            violations.append(violation)
-                            self.confirmed_violations.append(violation)
-                            self.last_violation_times[hand_id] = current_time
                             
-                            logger.warning(f"VIOLATION DETECTED! Hand in ROI for {time_in_roi:.2f}s "
-                                         f"without scooper, then moved to pizza")
-                    
-                    # Reset state for this hand after processing
-                    if hand_state.moved_to_pizza or time_in_roi > self.CLEANING_TIME_THRESHOLD:
-                        del self.hand_tracker[hand_id]
-                        logger.debug(f"Hand '{hand_id}' state cleared")
+                            violations.append(violation)
+                            self.violations_per_stream[stream_id].append(violation)
+                            self.last_violation_time[cooldown_key] = current_time
+                            
+                            # Mark tracker as processed
+                            tracker.is_active = False
+                            
+                            logger.warning(f"🚨 VIOLATION DETECTED in {stream_id}! "
+                                         f"Hand picked from ROI for {tracker.time_in_roi:.2f}s without scooper, "
+                                         f"then moved to pizza")
+                        
+                        elif tracker.had_scooper_in_roi:
+                            logger.info(f"✅ No violation - Hand {hand_id} used scooper")
+                        
+                        elif in_cooldown:
+                            logger.debug(f"Potential violation in cooldown for {hand_id}")
         
-        # Clean up stale hand states (hands that disappeared)
-        stale_timeout = 2.0  # seconds
-        stale_hands: List[str] = []
-        for hand_id, state in self.hand_tracker.items():
-            if hand_id not in current_frame_hand_ids:
-                if state.last_seen_in_roi and (current_time - state.last_seen_in_roi) > stale_timeout:
-                    stale_hands.append(hand_id)
-        
-        for hand_id in stale_hands:
-            del self.hand_tracker[hand_id]
-            logger.debug(f"Removed stale hand state: {hand_id}")
-        
-        # Store frame for history
-        self.frame_history.append({
+        # Store frame data for history
+        self.frame_buffer.append({
             'frame_id': frame_id,
             'timestamp': current_time,
             'hands': len(hands),
             'scoopers': len(scoopers),
+            'pizzas': len(pizzas),
             'violations': len(violations)
         })
         
@@ -253,8 +383,34 @@ class ViolationDetector:
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get violation detection statistics"""
-        return {
-            'total_violations': len(self.confirmed_violations),
-            'active_hands': len(self.hand_tracker),
-            'frames_processed': len(self.frame_history)
+        total_violations = sum(len(v) for v in self.violations_per_stream.values())
+        
+        stats = {
+            'total_violations': total_violations,
+            'active_hand_trackers': len([t for t in self.hand_states.values() if t.is_active]),
+            'hands_that_left_roi': len(self.hands_that_left_roi),
+            'frames_in_buffer': len(self.frame_buffer),
+            'streams_monitored': len(self.violations_per_stream)
         }
+        
+        # Add per-stream violation counts
+        for stream_id, violations in self.violations_per_stream.items():
+            stats[f'violations_{stream_id}'] = len(violations)
+        
+        return stats
+
+    def reset_stream(self, stream_id: str):
+        """Reset tracking for a specific stream"""
+        if stream_id in self.violations_per_stream:
+            del self.violations_per_stream[stream_id]
+        
+        # Clear hand trackers for this stream
+        to_remove = [hid for hid in self.hand_states.keys() if stream_id in hid]
+        for hid in to_remove:
+            del self.hand_states[hid]
+        
+        to_remove = [hid for hid in self.hands_that_left_roi.keys() if stream_id in hid]
+        for hid in to_remove:
+            del self.hands_that_left_roi[hid]
+        
+        logger.info(f"Reset tracking for stream: {stream_id}")

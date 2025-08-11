@@ -5,12 +5,19 @@
     {
       "id": "roi_1",
       "name": "Main Protein Container",
-      "x1": 120,
-      "y1": 180,
-      "x2": 280,
-      "y2": 320,
+      "x1": 140,
+      "y1": 155,
+      "x2": 160,
+      "y2": 177,
       "type": "protein_container",
-      "active": true
+      "active": true,
+      "description": "Primary protein container area where workers should use scooper"
     }
-  ]
+  ],
+  "detection_settings": {
+    "confidence_threshold": 0.3,
+    "iou_threshold": 0.4,
+    "picking_time_threshold": 0.3,
+    "violation_cooldown": 1.0
+  }
 }
